@@ -4,40 +4,34 @@ import java.util.*;
 import java.util.concurrent.*;
 
 /**
- * GameServer.java
- * The host runs this. Accepts up to 4 players, manages lobby,
- * syncs game state, saves results to MySQL.
- *
- * HOW TO RUN:
- *   javac -cp ".;mysql-connector-j-9.x.x.jar" GameServer.java GamePacket.java DatabaseManager.java
- *   java  -cp ".;mysql-connector-j-9.x.x.jar" GameServer
+ * GameServer.java - FIXED VERSION
+ * Fixes:
+ *  - broadcastLobbyUpdate now includes username correctly
+ *  - startGame properly initialises all player states
+ *  - State broadcast loop only runs when game is active
+ *  - Proper thread-safe client map
  */
 public class GameServer {
 
-    public static final int    PORT       = 55555;
-    public static final int    MAX_PLAYERS = 4;
+    public static final int PORT        = 55555;
+    public static final int MAX_PLAYERS = 4;
 
-    // ── State ────────────────────────────────────────────────
-    private ServerSocket                         serverSocket;
-    private final Map<Integer, ClientHandler>    clients    = new ConcurrentHashMap<>();
+    private ServerSocket serverSocket;
+    private final Map<Integer, ClientHandler> clients    = new ConcurrentHashMap<>();
     private final Map<Integer, GamePacket.PlayerState> gameStates = new ConcurrentHashMap<>();
-    private       boolean                        gameStarted = false;
-    private       int                            nextPlayerId = 1;
-    private       int                            matchId      = -1;
-    private       String                         gameMode     = "story";
+    private volatile boolean gameStarted  = false;
+    private          int     nextPlayerId = 1;
+    private          int     matchId      = -1;
+    private          String  gameMode     = "story";
 
-    // ── Database ─────────────────────────────────────────────
-    private final DatabaseManager db = new DatabaseManager();
+    private final DatabaseManager db          = new DatabaseManager();
     private       boolean         dbAvailable = false;
 
-    // ─────────────────────────────────────────────────────────
     public static void main(String[] args) {
-        GameServer server = new GameServer();
-        server.start();
+        new GameServer().start();
     }
 
     public void start() {
-        // Try to connect to database
         dbAvailable = db.connect();
         if (!dbAvailable)
             System.out.println("[Server] Running WITHOUT database (offline mode).");
@@ -45,36 +39,28 @@ public class GameServer {
         try {
             serverSocket = new ServerSocket(PORT);
             System.out.println("╔══════════════════════════════════╗");
-            System.out.println("║   VOIDWALKER GAME SERVER v1.0    ║");
+            System.out.println("║   VOIDWALKER GAME SERVER v2.0    ║");
             System.out.println("╠══════════════════════════════════╣");
-            System.out.println("║ Port    : " + PORT                      + "                  ║");
-            System.out.println("║ Players : max " + MAX_PLAYERS            + "                     ║");
-            System.out.println("║ DB      : " + (dbAvailable?"ONLINE":"OFFLINE") + "                ║");
+            System.out.printf ("║ Port    : %-23d║%n", PORT);
+            System.out.printf ("║ Max     : %-23d║%n", MAX_PLAYERS);
+            System.out.printf ("║ DB      : %-23s║%n", dbAvailable?"ONLINE":"OFFLINE");
             System.out.println("╚══════════════════════════════════╝");
-            System.out.println("Waiting for players to connect...\n");
+            System.out.println("Waiting for players...\n");
 
-            // Accept loop
             while (!serverSocket.isClosed()) {
                 Socket socket = serverSocket.accept();
+
+                // Reject if game already started
                 if (gameStarted) {
-                    // Reject latecomers
-                    ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-                    GamePacket err = new GamePacket();
-                    err.type    = GamePacket.TYPE_ERROR;
-                    err.message = "Game already in progress.";
-                    out.writeObject(err);
-                    socket.close();
+                    rejectClient(socket, "Game already in progress.");
                     continue;
                 }
+                // Reject if full
                 if (clients.size() >= MAX_PLAYERS) {
-                    ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
-                    GamePacket err = new GamePacket();
-                    err.type    = GamePacket.TYPE_ERROR;
-                    err.message = "Server is full (max " + MAX_PLAYERS + " players).";
-                    out.writeObject(err);
-                    socket.close();
+                    rejectClient(socket, "Server full (" + MAX_PLAYERS + " max).");
                     continue;
                 }
+
                 int id = nextPlayerId++;
                 ClientHandler handler = new ClientHandler(socket, id, this);
                 clients.put(id, handler);
@@ -83,61 +69,95 @@ public class GameServer {
 
         } catch (IOException e) {
             if (!serverSocket.isClosed())
-                System.err.println("[Server] Fatal error: " + e.getMessage());
+                System.err.println("[Server] Fatal: " + e.getMessage());
         } finally {
             db.disconnect();
         }
     }
 
-    // ── Called by host to start the game ─────────────────────
+    private void rejectClient(Socket socket, String reason) {
+        try {
+            ObjectOutputStream out = new ObjectOutputStream(socket.getOutputStream());
+            GamePacket err = new GamePacket();
+            err.type    = GamePacket.TYPE_ERROR;
+            err.message = reason;
+            out.writeObject(err);
+            out.flush();
+            socket.close();
+            System.out.println("[Server] Rejected client: " + reason);
+        } catch (IOException ignored) {}
+    }
+
+    // ── Start the game ────────────────────────────────────────────
     public synchronized void startGame(String mode) {
-        if (gameStarted || clients.isEmpty()) return;
+        if (gameStarted) {
+            System.out.println("[Server] startGame() called but game already started.");
+            return;
+        }
+        if (clients.isEmpty()) {
+            System.out.println("[Server] No players connected — cannot start.");
+            return;
+        }
+
         gameStarted = true;
         gameMode    = mode;
 
-        // Create match record in DB
+        System.out.println("[Server] Starting game! Mode=" + mode +
+                " Players=" + clients.size());
+
+        // Save match to DB
         if (dbAvailable) {
             matchId = db.createMatch(-1, clients.size(), mode);
-            System.out.println("[Server] Match #" + matchId + " started (" + mode + ")");
+            System.out.println("[Server] Match #" + matchId + " created in DB.");
         }
 
-        // Initialise player states
-        float[] spawnX = {200, 300, 200, 300};
-        float[] spawnY = {200, 200, 300, 300};
+        // Spawn positions for up to 4 players
+        float[] spawnX = {200f, 400f, 200f, 400f};
+        float[] spawnY = {200f, 200f, 400f, 400f};
+
+        // Create initial state for each player
         for (ClientHandler ch : clients.values()) {
-            int idx = ch.playerId - 1;
+            int idx = Math.min(ch.playerId - 1, 3);
             gameStates.put(ch.playerId, new GamePacket.PlayerState(
                     ch.playerId, ch.username,
                     spawnX[idx], spawnY[idx],
                     100, 100, 0, 0, true, true, 1
             ));
+            System.out.println("[Server] Initialised state for " +
+                    ch.username + " at (" + spawnX[idx] + "," + spawnY[idx] + ")");
         }
 
-        // Broadcast START to all
-        GamePacket start  = new GamePacket();
-        start.type        = GamePacket.TYPE_START;
-        start.gameMode    = mode;
-        start.players     = gameStates.values().toArray(new GamePacket.PlayerState[0]);
+        // Broadcast START to all clients
+        GamePacket start = new GamePacket();
+        start.type       = GamePacket.TYPE_START;
+        start.gameMode   = mode;
+        start.players    = gameStates.values()
+                .toArray(new GamePacket.PlayerState[0]);
         broadcast(start);
+        System.out.println("[Server] START packet broadcast to " +
+                clients.size() + " clients.");
 
-        System.out.println("[Server] Game started! Mode: " + mode);
-
-        // Start state broadcast loop (20 times per second)
+        // Start state sync loop (20fps)
         new Thread(this::stateBroadcastLoop, "StateBroadcast").start();
     }
 
-    // ── Broadcast game state 20× per second ──────────────────
+    // ── Sync loop ─────────────────────────────────────────────────
     private void stateBroadcastLoop() {
+        System.out.println("[Server] State broadcast loop started.");
         while (gameStarted && !serverSocket.isClosed()) {
-            GamePacket state   = new GamePacket();
-            state.type         = GamePacket.TYPE_STATE;
-            state.players      = gameStates.values().toArray(new GamePacket.PlayerState[0]);
-            broadcast(state);
+            if (!gameStates.isEmpty()) {
+                GamePacket state = new GamePacket();
+                state.type       = GamePacket.TYPE_STATE;
+                state.players    = gameStates.values()
+                        .toArray(new GamePacket.PlayerState[0]);
+                broadcast(state);
+            }
             try { Thread.sleep(50); } catch (InterruptedException e) { break; }
         }
+        System.out.println("[Server] State broadcast loop ended.");
     }
 
-    // ── Apply input from a client ─────────────────────────────
+    // ── Apply player input ────────────────────────────────────────
     public synchronized void applyInput(int playerId, GamePacket input) {
         GamePacket.PlayerState state = gameStates.get(playerId);
         if (state == null || !state.alive) return;
@@ -146,69 +166,76 @@ public class GameServer {
         if (input.moveUp)    state.y -= speed;
         if (input.moveDown)  state.y += speed;
         if (input.moveLeft)  { state.x -= speed; state.facingRight = false; }
-        if (input.moveRight) { state.x += speed; state.facingRight = true; }
+        if (input.moveRight) { state.x += speed; state.facingRight = true;  }
 
-        // Clamp to arena bounds (rough estimate)
-        state.x = Math.max(20, Math.min(1100, state.x));
-        state.y = Math.max(20, Math.min(700,  state.y));
+        // Clamp to reasonable bounds
+        state.x = Math.max(50, Math.min(1200, state.x));
+        state.y = Math.max(50, Math.min(750,  state.y));
     }
 
-    // ── Player disconnected ───────────────────────────────────
+    // ── Player disconnect ─────────────────────────────────────────
     public synchronized void playerLeft(int playerId) {
-        clients.remove(playerId);
+        ClientHandler ch = clients.remove(playerId);
         gameStates.remove(playerId);
-        System.out.println("[Server] Player " + playerId + " disconnected. (" + clients.size() + " remaining)");
-        broadcastLobbyUpdate();
+        String name = ch != null ? ch.username : "Player " + playerId;
+        System.out.println("[Server] " + name + " left. Remaining: " + clients.size());
 
-        if (gameStarted && clients.isEmpty()) {
+        if (clients.isEmpty() && gameStarted) {
             endGame();
+        } else {
+            broadcastLobbyUpdate();
         }
     }
 
-    // ── Game over ─────────────────────────────────────────────
+    // ── End game ──────────────────────────────────────────────────
     public synchronized void endGame() {
         if (!gameStarted) return;
         gameStarted = false;
+        System.out.println("[Server] Game ending...");
 
-        // Save stats to DB
         if (dbAvailable && matchId > 0) {
             for (GamePacket.PlayerState ps : gameStates.values()) {
                 db.savePlayerStats(matchId, -1, ps.playerId,
                         ps.score, ps.kills, 1, ps.alive);
-                db.updateHighScore(-1, ps.score);
             }
             db.endMatch(matchId);
-            System.out.println("[Server] Match #" + matchId + " saved to database.");
+            System.out.println("[Server] Match #" + matchId + " saved to DB.");
         }
 
         GamePacket over = new GamePacket();
-        over.type       = GamePacket.TYPE_GAME_OVER;
-        over.players    = gameStates.values().toArray(new GamePacket.PlayerState[0]);
+        over.type    = GamePacket.TYPE_GAME_OVER;
+        over.players = gameStates.values().toArray(new GamePacket.PlayerState[0]);
         broadcast(over);
-        System.out.println("[Server] Game over. Results saved.");
     }
 
-    // ── Send lobby update to all clients ─────────────────────
+    // ── Lobby update ──────────────────────────────────────────────
     public void broadcastLobbyUpdate() {
-        GamePacket pkt = new GamePacket();
-        pkt.type    = GamePacket.TYPE_LOBBY_UPDATE;
-        pkt.players = clients.values().stream()
-                .map(ch -> new GamePacket.PlayerState(
-                        ch.playerId, ch.username, 0, 0, 100, 100, 0, 0, true, true, 1))
-                .toArray(GamePacket.PlayerState[]::new);
+        GamePacket pkt  = new GamePacket();
+        pkt.type        = GamePacket.TYPE_LOBBY_UPDATE;
+
+        // Build player state list from connected clients
+        List<GamePacket.PlayerState> list = new ArrayList<>();
+        for (ClientHandler ch : clients.values()) {
+            list.add(new GamePacket.PlayerState(
+                    ch.playerId, ch.username,
+                    0, 0, 100, 100, 0, 0, true, true, 1));
+        }
+        pkt.players = list.toArray(new GamePacket.PlayerState[0]);
         pkt.message = "Players: " + clients.size() + "/" + MAX_PLAYERS +
-                (clients.size() == 1 ? "  (Waiting for more...)" :
-                        "  (Host: press ENTER to start)");
+                (clients.size() == 1 ? "  [Waiting for more...]"
+                        : "  [Host: press START to begin]");
+
         broadcast(pkt);
+        System.out.println("[Server] Lobby update: " + clients.size() + " players.");
     }
 
-    // ── Send to all connected clients ────────────────────────
+    // ── Broadcast to all ─────────────────────────────────────────
     public void broadcast(GamePacket packet) {
         for (ClientHandler ch : clients.values()) {
             ch.send(packet);
         }
     }
 
-    public boolean isGameStarted() { return gameStarted; }
-    public Map<Integer, ClientHandler> getClients() { return clients; }
+    public boolean isGameStarted()                          { return gameStarted; }
+    public Map<Integer, ClientHandler> getClients()         { return clients; }
 }

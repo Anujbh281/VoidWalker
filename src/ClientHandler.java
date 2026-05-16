@@ -4,7 +4,10 @@ import java.net.*;
 /**
  * ClientHandler.java
  * One instance runs on the server for each connected player.
- * Reads packets from that player and acts on them.
+ * FIXED:
+ *  - START command now uses its own packet type (TYPE_START_REQUEST)
+ *  - JOIN_ACK sent before lobby update so client is ready to receive
+ *  - Proper logging of all events
  */
 public class ClientHandler implements Runnable {
 
@@ -25,7 +28,7 @@ public class ClientHandler implements Runnable {
     @Override
     public void run() {
         try {
-            // Must create OutputStream FIRST, then InputStream
+            // OutputStream FIRST — critical for Java object streams
             out = new ObjectOutputStream(socket.getOutputStream());
             out.flush();
             in  = new ObjectInputStream(socket.getInputStream());
@@ -33,18 +36,17 @@ public class ClientHandler implements Runnable {
             System.out.println("[Server] Player " + playerId +
                     " connected from " + socket.getInetAddress());
 
-            // Read packets in a loop
             while (!socket.isClosed()) {
                 Object obj = in.readObject();
                 if (!(obj instanceof GamePacket)) continue;
-                GamePacket pkt = (GamePacket) obj;
-                handlePacket(pkt);
+                handlePacket((GamePacket) obj);
             }
 
         } catch (EOFException | SocketException e) {
-            // Client disconnected normally
+            System.out.println("[Server] Player " + playerId + " disconnected.");
         } catch (IOException | ClassNotFoundException e) {
-            System.err.println("[Server] Error with player " + playerId + ": " + e.getMessage());
+            System.err.println("[Server] Error with player " + playerId +
+                    ": " + e.getMessage());
         } finally {
             server.playerLeft(playerId);
             try { socket.close(); } catch (IOException ignored) {}
@@ -54,62 +56,83 @@ public class ClientHandler implements Runnable {
     private void handlePacket(GamePacket pkt) {
         switch (pkt.type) {
 
+            // ── Player joins lobby ────────────────────────────────
             case GamePacket.TYPE_JOIN -> {
-                // Player introducing themselves
-                this.username = pkt.username != null ? pkt.username : "Player" + playerId;
+                this.username = (pkt.username != null && !pkt.username.isBlank())
+                        ? pkt.username : "Player" + playerId;
 
-                // Send welcome acknowledgement
-                GamePacket ack  = new GamePacket();
-                ack.type        = GamePacket.TYPE_JOIN_ACK;
-                ack.playerId    = playerId;
-                ack.username    = this.username;
-                ack.message     = "Welcome, " + this.username + "! You are Player " + playerId + ".";
+                System.out.println("[Server] '" + username +
+                        "' joined as Player " + playerId);
+
+                // Send ACK first so client knows its ID
+                GamePacket ack = new GamePacket();
+                ack.type       = GamePacket.TYPE_JOIN_ACK;
+                ack.playerId   = playerId;
+                ack.username   = this.username;
+                ack.message    = "Welcome " + this.username +
+                        "! You are Player " + playerId + ".";
                 send(ack);
 
-                System.out.println("[Server] " + username + " joined as Player " + playerId);
+                // NOW broadcast updated player list to everyone
                 server.broadcastLobbyUpdate();
             }
 
+            // ── Player input during game ──────────────────────────
             case GamePacket.TYPE_INPUT -> {
-                // Apply movement/actions
                 if (server.isGameStarted()) {
                     server.applyInput(playerId, pkt);
                 }
             }
 
+            // ── Chat message ──────────────────────────────────────
             case GamePacket.TYPE_CHAT -> {
-                // Relay chat to all
                 pkt.playerId = this.playerId;
                 pkt.username = this.username;
                 server.broadcast(pkt);
                 System.out.println("[Chat] " + username + ": " + pkt.message);
             }
 
+            // ── Host requests game start ──────────────────────────
+            case "START_REQUEST" -> {
+                if (playerId != 1) {
+                    GamePacket err = new GamePacket();
+                    err.type    = GamePacket.TYPE_ERROR;
+                    err.message = "Only the host (Player 1) can start the game.";
+                    send(err);
+                    return;
+                }
+                if (server.isGameStarted()) {
+                    GamePacket err = new GamePacket();
+                    err.type    = GamePacket.TYPE_ERROR;
+                    err.message = "Game already started.";
+                    send(err);
+                    return;
+                }
+                String mode = (pkt.gameMode != null &&
+                        pkt.gameMode.equals("endless")) ? "endless" : "story";
+                System.out.println("[Server] Host requested start: mode=" + mode);
+                server.startGame(mode);
+            }
+
+            // ── Keepalive ─────────────────────────────────────────
             case GamePacket.TYPE_PING -> {
-                // Respond to keepalive
                 send(GamePacket.ping());
             }
 
-            // Host-only: start game command sent as a chat "/start"
-            // (Player 1 = host)
             default -> {
-                if (pkt.message != null && pkt.message.startsWith("/start")
-                        && playerId == 1 && !server.isGameStarted()) {
-                    String mode = pkt.message.contains("endless") ? "endless" : "story";
-                    server.startGame(mode);
-                }
+                // Ignore unknown packet types silently
             }
         }
     }
 
-    /** Thread-safe send. */
+    /** Thread-safe send to this client. */
     public synchronized void send(GamePacket packet) {
         try {
             out.writeObject(packet);
             out.flush();
-            out.reset(); // important: prevents stale cached objects
+            out.reset(); // prevents stale cached objects
         } catch (IOException e) {
-            // Client likely disconnected — will be caught in run() loop
+            // Client disconnected — run() loop will catch it
         }
     }
 }

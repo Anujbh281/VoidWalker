@@ -1,4 +1,5 @@
 import javax.swing.*;
+import java.awt.Component;
 import java.awt.*;
 import java.awt.event.*;
 import java.util.function.Consumer;
@@ -180,9 +181,11 @@ public class LobbyScreen extends JPanel {
 
         int count = players != null ? players.length : 0;
 
-        // Find parent label and update count
-        ((TitledPanel) playerListPanel.getParent().getParent())
-                .setTitle("PLAYERS (" + count + "/4)");
+        // Update title safely
+        try {
+            ((TitledPanel) playerListPanel.getParent().getParent())
+                    .setTitle("PLAYERS (" + count + "/4)");
+        } catch (Exception ignored) {}
 
         for (int i = 0; i < 4; i++) {
             if (players != null && i < players.length) {
@@ -213,9 +216,25 @@ public class LobbyScreen extends JPanel {
 
     // ── Host starts game ──────────────────────────────────────
     private void hostStart(String mode) {
-        client.hostStartGame(mode);
+        if (!client.isConnected()) {
+            statusLabel.setForeground(new Color(255, 80, 80));
+            statusLabel.setText("Not connected to server!");
+            return;
+        }
+        if (client.getPlayerId() != 1) {
+            statusLabel.setForeground(new Color(255, 80, 80));
+            statusLabel.setText("Only the host (Player 1) can start!");
+            return;
+        }
+        System.out.println("[Lobby] Host sending start request: " + mode);
+        statusLabel.setForeground(new Color(80, 255, 130));
         statusLabel.setText("Starting " + mode + " game...");
-        if (startBtn != null) startBtn.setEnabled(false);
+        // Disable both start buttons
+        for (Component c : ((JPanel)statusLabel.getParent()
+                .getComponent(1)).getComponents()) {
+            if (c instanceof JButton) c.setEnabled(false);
+        }
+        client.hostStartGame(mode);
     }
 
     // ── Helpers ───────────────────────────────────────────────

@@ -4,31 +4,22 @@ import java.awt.image.*;
 import java.util.List;
 
 /**
- * ShadowRenderer — Correct circular lighting, works at any resolution.
- *
- * KEY FIX for fullscreen jank:
- *   darkBuffer is padded by lightR on all sides so the DstIn punch
- *   never goes out of bounds even when the player is at a screen edge.
- *   The buffer is drawn offset so the visible 960×640 area is correct.
- *
- *   Buffer size = (SW + 2*PAD) × (SH + 2*PAD)
- *   Draw offset = (-PAD, -PAD)
- *   Player position in buffer = (screenPX + PAD, screenPY + PAD)
+ * ShadowRenderer — Correct darkness-with-light-hole approach.
+ * Uses DstIn composite to punch a transparent circle into a dark buffer.
+ * Result: scene is visible inside the circle, dark outside. No blue glow.
  */
 public class ShadowRenderer {
 
-    // Game-space resolution — never changes
     static final int SW  = 960;
     static final int SH  = 640;
-    // Padding = max possible light radius so edge punches never overflow
-    static final int PAD = 300;
+    static final int PAD = 300; // padding so edge punches never overflow
 
-    // ── Offscreen dark buffer (padded) ────────────────────────────
+    // Dark buffer (screen + padding on all sides)
     private static BufferedImage darkBuffer = null;
     private static Graphics2D    darkG      = null;
     private static Quality       bufQuality = null;
 
-    // Gradient config — rebuilt on quality change
+    // Gradient config
     private static int      lightR      = 0;
     private static int      enemyLightR = 0;
     private static float[]  GRAD_FRAC   = { 0f, 0.45f, 0.80f, 1f };
@@ -40,10 +31,8 @@ public class ShadowRenderer {
     private static BufferedImage shadowSpriteDash = null;
     private static Quality       shadowQuality    = null;
 
-    // Reused transform — zero alloc
     private static final AffineTransform REUSE_AT = new AffineTransform();
 
-    // Cached composites
     private static final AlphaComposite AC_SRC_OVER =
             AlphaComposite.getInstance(AlphaComposite.SRC_OVER);
     private static final AlphaComposite AC_DST_IN =
@@ -52,9 +41,7 @@ public class ShadowRenderer {
     private static final Color DARK_BASE  = new Color(0, 0, 0, 185);
     private static final Color SHADOW_LOW = new Color(0, 0, 0, 50);
 
-    // ─────────────────────────────────────────────────────────────
-    //  LIGHTING PASS — call once per frame in GAME SPACE (960×640)
-    // ─────────────────────────────────────────────────────────────
+    // ── Main lighting pass ────────────────────────────────────────
     public static void drawLightingPass(Graphics2D screenG,
                                         int playerSX, int playerSY,
                                         List<Enemy> enemies,
@@ -66,41 +53,33 @@ public class ShadowRenderer {
         int bw = SW + PAD*2;
         int bh = SH + PAD*2;
 
-        // ── Reset buffer to solid dark ────────────────────────────
+        // Reset buffer to solid dark
         darkG.setComposite(AC_SRC_OVER);
         darkG.setColor(DARK_BASE);
         darkG.fillRect(0, 0, bw, bh);
 
-        // ── Enemy lights (punch into buffer) ─────────────────────
+        // Enemy lights (dim, punched first)
         if (enemies != null) {
             for (Enemy en : enemies) {
                 if (!en.alive) continue;
-                // Enemy position in buffer space = screen pos + PAD
                 int ex = (int)en.x - camX + PAD;
                 int ey = (int)en.y - camY + PAD;
-                // Cull if completely outside padded buffer
                 if (ex < -enemyLightR || ex > bw + enemyLightR) continue;
                 if (ey < -enemyLightR || ey > bh + enemyLightR) continue;
                 punchLight(ex, ey, enemyLightR, ENEMY_COLS);
             }
         }
 
-        // ── Player light — always in buffer (PAD ensures no overflow) ──
+        // Player light (bright, punched last so it overrides)
         punchLight(playerSX + PAD, playerSY + PAD, lightR, GRAD_COLS);
 
-        // ── Draw buffer offset by -PAD so game area aligns to screen ──
+        // Draw buffer offset by -PAD onto screen
         Composite saved = screenG.getComposite();
         screenG.setComposite(AC_SRC_OVER);
-        // Draw buffer shifted left/up by PAD — the PAD pixels on each
-        // side extend beyond the screen edge and are clipped naturally
         screenG.drawImage(darkBuffer, -PAD, -PAD, null);
         screenG.setComposite(saved);
     }
 
-    /**
-     * Punch a transparent circle hole into darkBuffer using DstIn.
-     * All coordinates are in buffer space (already offset by PAD).
-     */
     private static void punchLight(int cx, int cy, int r, Color[] cols) {
         RadialGradientPaint rp = new RadialGradientPaint(
                 new Point2D.Float(cx, cy), r,
@@ -113,94 +92,76 @@ public class ShadowRenderer {
         darkG.setComposite(AC_SRC_OVER);
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  GROUND SHADOW
-    // ─────────────────────────────────────────────────────────────
+    // ── Ground shadow ─────────────────────────────────────────────
     public static void drawGroundShadow(Graphics2D g,
                                         float px, float py,
                                         float vx, float vy,
                                         boolean dashing,
                                         Quality quality) {
         ensureShadowSprites(quality);
-
         if (quality == Quality.LOW) {
             g.setColor(SHADOW_LOW);
             g.fillOval((int)px - 12, (int)py + 10, 24, 7);
             return;
         }
-
-        float speed = (float) Math.sqrt(vx*vx + vy*vy);
+        float speed = (float)Math.sqrt(vx*vx + vy*vy);
         BufferedImage sprite;
         float scaleX, scaleY, rot;
-
         if (dashing) {
             sprite = shadowSpriteDash;
             scaleX = 1.5f; scaleY = 0.6f;
-            rot    = speed > 0 ? (float) Math.atan2(vy, vx) : 0f;
+            rot = speed > 0 ? (float)Math.atan2(vy, vx) : 0f;
         } else if (speed > 0.3f) {
             sprite = shadowSprite;
             scaleX = Math.min(1.5f, 1f + speed * 0.065f);
             scaleY = 1f;
-            rot    = (float) Math.atan2(vy, vx);
+            rot = (float)Math.atan2(vy, vx);
         } else {
             sprite = shadowSprite;
             scaleX = 1f; scaleY = 1f; rot = 0f;
         }
-
         int hw = sprite.getWidth()  / 2;
         int hh = sprite.getHeight() / 2;
-
         REUSE_AT.setToTranslation(px, py + 13f);
         if (rot != 0f)   REUSE_AT.rotate(rot);
         if (scaleX != 1f || scaleY != 1f) REUSE_AT.scale(scaleX, scaleY);
         REUSE_AT.translate(-hw, -hh);
-
         g.drawImage(sprite, REUSE_AT, null);
     }
 
     public static void invalidateCache() {
         if (darkG != null) { darkG.dispose(); darkG = null; }
-        darkBuffer       = null;
-        bufQuality       = null;
-        shadowSprite     = null;
-        shadowSpriteDash = null;
-        shadowQuality    = null;
-        GRAD_COLS        = null;
-        ENEMY_COLS       = null;
+        darkBuffer = null; bufQuality = null;
+        shadowSprite = null; shadowSpriteDash = null; shadowQuality = null;
+        GRAD_COLS = null; ENEMY_COLS = null;
     }
 
-    // ─────────────────────────────────────────────────────────────
-    //  BUILDERS
-    // ─────────────────────────────────────────────────────────────
     private static void ensureBuffer(Quality quality) {
         if (darkBuffer != null && bufQuality == quality) return;
         bufQuality = quality;
         if (darkG != null) darkG.dispose();
-
-        // Padded buffer — prevents edge overflow for any player position
-        int bw = SW + PAD*2;
-        int bh = SH + PAD*2;
+        int bw = SW + PAD*2, bh = SH + PAD*2;
         darkBuffer = new BufferedImage(bw, bh, BufferedImage.TYPE_INT_ARGB);
-        darkG      = darkBuffer.createGraphics();
+        darkG = darkBuffer.createGraphics();
         darkG.setRenderingHint(RenderingHints.KEY_ANTIALIASING,
                 RenderingHints.VALUE_ANTIALIAS_ON);
         darkG.setRenderingHint(RenderingHints.KEY_RENDERING,
                 RenderingHints.VALUE_RENDER_SPEED);
-
         lightR      = (quality == Quality.HIGH) ? 260 : 210;
         enemyLightR = (quality == Quality.HIGH) ?  80 :  60;
-
-        GRAD_COLS = new Color[] {
-                new Color(0, 0, 0,   0),
-                new Color(0, 0, 0,   0),
-                new Color(0, 0, 0, 130),
-                new Color(0, 0, 0, 255),
+        // Player: transparent centre (bright) → fully dark edge
+        GRAD_COLS = new Color[]{
+                new Color(0,0,0,0),
+                new Color(0,0,0,0),
+                new Color(0,0,0,130),
+                new Color(0,0,0,255),
         };
-        ENEMY_COLS = new Color[] {
-                new Color(0, 0, 0,  80),
-                new Color(0, 0, 0, 140),
-                new Color(0, 0, 0, 210),
-                new Color(0, 0, 0, 255),
+        // Enemy: dimmer — keeps more darkness
+        ENEMY_COLS = new Color[]{
+                new Color(0,0,0,80),
+                new Color(0,0,0,140),
+                new Color(0,0,0,210),
+                new Color(0,0,0,255),
         };
     }
 
@@ -221,17 +182,14 @@ public class ShadowRenderer {
         float maxR = Math.max(pw, ph) / 2f;
         RadialGradientPaint rp = new RadialGradientPaint(
                 new Point2D.Float(pw/2f, ph/2f), maxR,
-                new float[]{ 0f, 0.45f, 1f },
-                new Color[]{ new Color(0,0,0,ca),
-                        new Color(0,0,0,ca/2),
-                        new Color(0,0,0,0) },
+                new float[]{0f, 0.45f, 1f},
+                new Color[]{new Color(0,0,0,ca), new Color(0,0,0,ca/2), new Color(0,0,0,0)},
                 MultipleGradientPaint.CycleMethod.NO_CYCLE
         );
         g.translate(pw/2.0, ph/2.0);
         g.scale(1.0, (double)h/w);
         g.translate(-pw/2.0, -ph/2.0);
-        g.setPaint(rp);
-        g.fillOval(0, 0, pw, ph);
+        g.setPaint(rp); g.fillOval(0, 0, pw, ph);
         g.dispose();
         return img;
     }

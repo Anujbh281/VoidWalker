@@ -72,9 +72,10 @@ public class GameClient {
                 receiveLoop();
 
             } catch (ConnectException e) {
-                notifyError("Could not connect. Is the host running the server?");
+                notifyError("Could not connect to " + host + ":" + PORT +
+                        ". Is the server running?");
             } catch (SocketTimeoutException e) {
-                notifyError("Connection timed out. Check the IP address.");
+                notifyError("Connection timed out after 5s. Check the IP: " + host);
             } catch (IOException e) {
                 if (connected) notifyError("Connection lost: " + e.getMessage());
                 else           notifyError("Connection failed: " + e.getMessage());
@@ -113,6 +114,12 @@ public class GameClient {
 
             case GamePacket.TYPE_LOBBY_UPDATE -> {
                 System.out.println("[Lobby] " + pkt.message);
+                if (pkt.players != null) {
+                    for (GamePacket.PlayerState ps : pkt.players) {
+                        System.out.println("[Lobby]   P" + ps.playerId +
+                                " = " + ps.username);
+                    }
+                }
                 if (onLobbyUpdate != null) onLobbyUpdate.accept(pkt);
             }
 
@@ -174,10 +181,16 @@ public class GameClient {
      * @param mode "story" or "endless"
      */
     public void hostStartGame(String mode) {
+        if (!connected) {
+            System.err.println("[Client] Cannot start — not connected.");
+            return;
+        }
         GamePacket pkt = new GamePacket();
-        pkt.type    = "COMMAND";
-        pkt.message = "/start " + mode;
+        pkt.type     = "START_REQUEST";  // matches ClientHandler case
+        pkt.gameMode = mode;
+        pkt.playerId = myPlayerId;
         send(pkt);
+        System.out.println("[Client] Sent START_REQUEST mode=" + mode);
     }
 
     /** Disconnect cleanly. */

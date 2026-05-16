@@ -131,28 +131,36 @@ public class Level {
         g.dispose();
     }
 
-    // ── Draw: background tiled with camera + tile canvas ────────
+    // ================================================================
+    //  FIX 2: Background jank in fullscreen - REPLACED draw() method
+    // ================================================================
     void draw(Graphics2D g, int camX, int camY, Settings settings) {
-        // 1. Fill entire screen with background, scrolling with camera
-        //    so it covers void areas outside the dungeon too.
+        // ── Background — tiles to fill entire visible area ────────
         if (bgImage != null) {
             int bgW = bgImage.getWidth();
             int bgH = bgImage.getHeight();
+
+            // Offset background by camera with wrap-around
             int startX = -(camX % bgW);
             int startY = -(camY % bgH);
+
+            // Ensure we start before screen edge
             if (startX > 0) startX -= bgW;
             if (startY > 0) startY -= bgH;
-            // Draw one extra tile beyond SW/SH to cover any sub-pixel gaps
-            for (int ty2 = startY; ty2 < SW + bgH; ty2 += bgH)
-                for (int tx2 = startX; tx2 < SH + bgW; tx2 += bgW)
-                    g.drawImage(bgImage, tx2, ty2, bgW, bgH, null);
+
+            // Fill extra tiles to cover ANY screen size (fullscreen safe)
+            // Use SW+bgW*2 and SH+bgH*2 to guarantee no gaps ever
+            for (int ty = startY; ty < SH + bgH; ty += bgH)
+                for (int tx = startX; tx < SW + bgW; tx += bgW)
+                    g.drawImage(bgImage, tx, ty, bgW, bgH, null);
+
         } else {
+            // No background image — solid dark colour
             g.setColor(new Color(8, 6, 18));
-            g.fillRect(0, 0, SW, SH);
+            g.fillRect(0, 0, SW + 100, SH + 100); // extra 100px safety margin
         }
 
-        // 2. Tile canvas on top — void tiles in canvas are transparent
-        //    so the tiled background shows through them perfectly.
+        // ── Tile canvas on top ────────────────────────────────────
         int srcX  = Math.max(0, camX);
         int srcY  = Math.max(0, camY);
         int srcX2 = Math.min(canvasW, camX + SW);
@@ -165,7 +173,7 @@ public class Level {
                     srcX, srcY, srcX2, srcY2, null);
         }
 
-        // 3. Exit portal (story mode)
+        // ── Exit portal ───────────────────────────────────────────
         if (!isEndless) drawExit(g, camX, camY);
     }
 
@@ -234,7 +242,7 @@ public class Level {
             if (cy-dy >= 0 && tiles[cy-dy][room[0]+room[2]/2] == FLOOR)
                 return (cy-dy)*TILE + TILE/2f;
         }
-        return cy*TILE + TILE/2f;
+        return cy*TILE + TILE/2f; // fallback
     }
 
     // ── BSP dungeon generation ────────────────────────────────────

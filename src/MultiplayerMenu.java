@@ -155,7 +155,28 @@ public class MultiplayerMenu extends JPanel {
 
     private void showLobby(boolean isHost, String name) {
         LobbyScreen lobby = new LobbyScreen(client, isHost, name);
-        lobby.setOnGameStart(onGameStart);
+
+        // When server sends START packet, switch frame back to game
+        lobby.setOnGameStart(() -> {
+            System.out.println("[MultiplayerMenu] Game started — switching to GamePanel");
+            // Find the GamePanel that was hidden when we opened multiplayer menu
+            // by calling the original onGameStart callback which is in GamePanel
+            javax.swing.SwingUtilities.invokeLater(() -> {
+                // Remove lobby from frame
+                frame.getContentPane().removeAll();
+
+                // onGameStart was set in GamePanel.showMultiplayerMenu():
+                //   frame.getContentPane().removeAll();
+                //   frame.getContentPane().add(mp);  ← mp = this MultiplayerMenu
+                // So we need to re-add the GamePanel.
+                // The onGameStart runnable calls newGame() AND adds panel back.
+                if (onGameStart != null) onGameStart.run();
+
+                frame.revalidate();
+                frame.repaint();
+            });
+        });
+
         frame.getContentPane().removeAll();
         frame.getContentPane().add(lobby);
         frame.revalidate();

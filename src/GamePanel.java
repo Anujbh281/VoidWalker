@@ -47,7 +47,7 @@ public class GamePanel extends JPanel implements ActionListener {
 
     // ── Endless mode ─────────────────────────────────────────────
     boolean       endlessMode     = false;
-    int           exitFrameCount  = 0;   // prevents instant-exit on spawn  // TRUE = we are in endless, never touches story save
+    int           exitFrameCount  = 0;
     int           waveNumber      = 0;
     int           waveCooldown    = 0;
     boolean       waitingNextWave = false;
@@ -59,9 +59,9 @@ public class GamePanel extends JPanel implements ActionListener {
     int aiThrottleFrame = 0;
 
     // ── Projectile finite range ───────────────────────────────────
-    static final int PROJ_MAX_RANGE = 420;  // pixels — projectile deactivates beyond this
+    static final int PROJ_MAX_RANGE = 420;
 
-    // ── Cached Colors / Strokes / Fonts (zero per-frame alloc) ───
+    // ── Cached Colors / Strokes / Fonts ───
     private static final Color C_RED     = new Color(220,  50,  50);
     private static final Color C_BLUE    = new Color(  0, 150, 255);
     private static final Color C_GOLD    = new Color(255, 200,  60);
@@ -75,7 +75,6 @@ public class GamePanel extends JPanel implements ActionListener {
     private static final Color C_BOSS2   = new Color(255, 150,  50);
     private static final Color C_PHIT    = new Color(100, 150, 255);
 
-    // Pre-cached AlphaComposite instances — avoid getInstance() per frame
     private static final AlphaComposite AC_SRC_OVER =
             AlphaComposite.getInstance(AlphaComposite.SRC_OVER);
     private static final BasicStroke STR_DASH = new BasicStroke(1.4f);
@@ -89,12 +88,9 @@ public class GamePanel extends JPanel implements ActionListener {
     private static final Font F_LG  = new Font("Monospaced", Font.BOLD,  16);
     private static final Font F_SM  = new Font("Monospaced", Font.PLAIN, 11);
 
-    // ── Spatial grid for collision (avoids O(n²) enemy checks) ───
+    // ── Spatial grid for collision ───
     private static final int GRID_CELL = 128;
     private final java.util.HashMap<Long, java.util.List<Enemy>> spatialGrid = new java.util.HashMap<>();
-
-    // ── Vignette cache ────────────────────────────────────────────
-    // vignetteImage removed — replaced by ShadowRenderer
 
     // ── Cursor management ─────────────────────────────────────────
     private Cursor invisibleCursor;
@@ -106,7 +102,7 @@ public class GamePanel extends JPanel implements ActionListener {
         setPreferredSize(new Dimension(SCREEN_W, SCREEN_H));
         setBackground(Color.BLACK);
         setFocusable(true);
-        setDoubleBuffered(true);  // ensures Swing uses offscreen buffer
+        setDoubleBuffered(true);
 
         settings  = Settings.load();
         saveData  = SaveData.load();
@@ -140,16 +136,14 @@ public class GamePanel extends JPanel implements ActionListener {
         });
 
         gameTimer = new Timer(FRAME_TIME, this);
+        gameTimer.start();
 
-        // Prepare both cursors
         BufferedImage blank = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
         invisibleCursor = Toolkit.getDefaultToolkit().createCustomCursor(blank, new Point(0,0), "blank");
         defaultCursor   = Cursor.getDefaultCursor();
-        // Start with default cursor on menu
         setCursor(defaultCursor);
     }
 
-    // ── Cursor control ───────────────────────────────────────────
     void showCursor() {
         if (cursorHidden) { setCursor(defaultCursor); cursorHidden = false; }
     }
@@ -168,15 +162,17 @@ public class GamePanel extends JPanel implements ActionListener {
 
     void startGame() { gameTimer.start(); }
 
-    // ── Story mode ───────────────────────────────────────────────
     void newGame() {
+        System.out.println("[DEBUG] newGame() called");
         endlessMode = false;
         levelNum = 1;
         startLevel();
         audio.playLevelMusic();
+        System.out.println("[DEBUG] Level started");
     }
 
     void loadGame() {
+        System.out.println("[DEBUG] loadGame() called");
         endlessMode = false;
         levelNum = saveData.level;
         startLevel();
@@ -199,7 +195,6 @@ public class GamePanel extends JPanel implements ActionListener {
     }
 
     void nextLevel() {
-        // Guard: nextLevel must NEVER be called in endless mode
         if (endlessMode) return;
 
         int sc = player != null ? player.score : 0;
@@ -229,9 +224,9 @@ public class GamePanel extends JPanel implements ActionListener {
         state = GameState.TRANSITION; transitionTimer = TRANSITION_DURATION;
     }
 
-    // ── Endless mode ─────────────────────────────────────────────
     void startEndlessMode() {
-        endlessMode = true;           // ← key flag: no story saves touched
+        System.out.println("[DEBUG] startEndlessMode() called");
+        endlessMode = true;
         TextureFactory.preload(Level.TILE);
         Level.loadBackground();
         currentLevel    = new Level(true);
@@ -254,7 +249,7 @@ public class GamePanel extends JPanel implements ActionListener {
     void spawnWave() {
         waveNumber++;
         currentLevel.enemies.clear();
-        projPool.clear();   // clear stale enemy projectiles between waves
+        projPool.clear();
 
         float hpScale = 1f + waveNumber * 0.15f;
         float spScale = 1f + waveNumber * 0.04f;
@@ -267,7 +262,6 @@ public class GamePanel extends JPanel implements ActionListener {
         boolean isBoss     = (waveNumber % 10 == 0);
         boolean isMiniBoss = (!isBoss && waveNumber % 5 == 0);
         int count = isBoss ? 1 : (isMiniBoss ? baseCount/2 + 1 : baseCount);
-        // Cap count so the game stays playable at very high waves
         count = Math.min(count, 30);
 
         for (int i = 0; i < count; i++) {
@@ -290,7 +284,6 @@ public class GamePanel extends JPanel implements ActionListener {
         waitingNextWave = false;
     }
 
-    // ── Spatial grid helpers (fast enemy lookups) ────────────────
     long cellKey(int cx, int cy) { return ((long)cx << 32) | (cy & 0xFFFFFFFFL); }
 
     void rebuildSpatialGrid() {
@@ -303,7 +296,6 @@ public class GamePanel extends JPanel implements ActionListener {
         }
     }
 
-    /** Return enemies near (px,py) within radius — uses spatial grid. */
     List<Enemy> nearbyEnemies(float px, float py, float radius) {
         List<Enemy> result = new ArrayList<>();
         int r  = (int)(radius / GRID_CELL) + 1;
@@ -317,7 +309,6 @@ public class GamePanel extends JPanel implements ActionListener {
         return result;
     }
 
-    // ── Aim helpers ──────────────────────────────────────────────
     float getAimAngle() {
         if (player == null) return 0f;
         float wmx = input.mouseX + camera.getX();
@@ -343,11 +334,9 @@ public class GamePanel extends JPanel implements ActionListener {
                 spdM, pierc, expl, sizeB);
     }
 
-    // ── Main loop ────────────────────────────────────────────────
     @Override public void actionPerformed(ActionEvent e) { update(); repaint(); }
 
     void update() {
-        // Cursor management based on state
         switch (state) {
             case MENU, HELP, SETTINGS, UPGRADE_SELECT, GAME_OVER, WIN, PAUSED -> showCursor();
             case PLAYING, ENDLESS -> hideCursor();
@@ -368,20 +357,55 @@ public class GamePanel extends JPanel implements ActionListener {
     }
 
     void updateMenu() {
-        // Make sure menu music plays
         if (audio.currentLoop != audio.menuMusicClip
                 || (audio.menuMusicClip != null && !audio.menuMusicClip.isRunning())) {
             audio.playMenuMusic();
         }
+
+        if (enterPressed) {
+            audio.menuClick();
+            newGame();
+            state = GameState.TRANSITION;
+            transitionTimer = TRANSITION_DURATION;
+            enterPressed = false;
+            return;
+        }
+
         if (!input.mouseClicked) return;
-        int cx = input.clickX, cy = input.clickY; input.consumeClick();
+        int cx = input.clickX, cy = input.clickY;
+        input.consumeClick();
         List<MenuSystem.Button> btns = menu.mainButtons;
-        if      (btns.get(0).clicked(cx,cy)) { audio.menuClick(); newGame();          state = GameState.TRANSITION; transitionTimer = TRANSITION_DURATION; }
-        else if (btns.get(1).clicked(cx,cy)) { audio.menuClick(); loadGame();         state = GameState.PLAYING; }
-        else if (btns.get(2).clicked(cx,cy)) { audio.menuClick(); startEndlessMode(); }
-        else if (btns.get(3).clicked(cx,cy)) { audio.menuClick(); state = GameState.HELP; }
-        else if (btns.get(4).clicked(cx,cy)) { audio.menuClick(); prevState = GameState.MENU; state = GameState.SETTINGS; }
-        else if (btns.get(5).clicked(cx,cy)) { System.exit(0); }
+
+        if (btns.get(0).clicked(cx,cy)) {
+            audio.menuClick();
+            newGame();
+            state = GameState.TRANSITION;
+            transitionTimer = TRANSITION_DURATION;
+            System.out.println("[DEBUG] Starting new game...");
+        }
+        else if (btns.get(1).clicked(cx,cy)) {
+            audio.menuClick();
+            loadGame();
+            state = GameState.PLAYING;
+            System.out.println("[DEBUG] Loading game...");
+        }
+        else if (btns.get(2).clicked(cx,cy)) {
+            audio.menuClick();
+            startEndlessMode();
+            System.out.println("[DEBUG] Starting endless mode...");
+        }
+        else if (btns.get(3).clicked(cx,cy)) {
+            audio.menuClick();
+            state = GameState.HELP;
+        }
+        else if (btns.get(4).clicked(cx,cy)) {
+            audio.menuClick();
+            prevState = GameState.MENU;
+            state = GameState.SETTINGS;
+        }
+        else if (btns.get(5).clicked(cx,cy)) {
+            System.exit(0);
+        }
         else if (btns.get(6).clicked(cx,cy)) {
             audio.menuClick();
             showMultiplayerMenu();
@@ -404,55 +428,69 @@ public class GamePanel extends JPanel implements ActionListener {
             saveData.highScore = Math.max(saveData.highScore, player.score);
         }
 
-        // ── ADD THIS BLOCK: save score to database ────────────────
         if (db != null && db.isConnected() && player != null
                 && VoidWalker.currentUserId > 0) {
-            // Update online high score
             db.updateHighScore(VoidWalker.currentUserId, player.score);
-            System.out.println("[DB] Saved score " + player.score +
-                    " for " + VoidWalker.currentUsername);
         }
-        // ── END BLOCK ─────────────────────────────────────────────
 
         boolean clicked = input.mouseClicked;
         int cx = input.clickX, cy = input.clickY;
 
-        // Play Again button: SCREEN_W/2+20 to +220, SCREEN_H/2+95 to +137
-        boolean playAgain = clicked &&
-                cx >= SCREEN_W/2+20 && cx <= SCREEN_W/2+220 &&
-                cy >= SCREEN_H/2+95 && cy <= SCREEN_H/2+137;
-        // Main Menu button: SCREEN_W/2-220 to -20
-        boolean mainMenu  = clicked &&
-                cx >= SCREEN_W/2-220 && cx <= SCREEN_W/2-20 &&
-                cy >= SCREEN_H/2+95  && cy <= SCREEN_H/2+137;
+        int pw = 520, ph = 380;
+        int px2 = SCREEN_W/2 - pw/2;
+        int py2 = SCREEN_H/2 - ph/2;
 
-        if (enterPressed || mainMenu) {
+        int mainMenuX = SCREEN_W/2 - 220;
+        int mainMenuY = py2 + ph - 65;
+
+        int playAgainX = SCREEN_W/2 + 20;
+        int playAgainY = py2 + ph - 65;
+
+        boolean mainMenuClicked  = clicked &&
+                cx >= mainMenuX  && cx <= mainMenuX  + 200 &&
+                cy >= mainMenuY  && cy <= mainMenuY  + 42;
+
+        boolean playAgainClicked = clicked && state == GameState.GAME_OVER &&
+                cx >= playAgainX && cx <= playAgainX + 200 &&
+                cy >= playAgainY && cy <= playAgainY + 42;
+
+        int winMenuX = SCREEN_W/2 - 100;
+        int winMenuY = py2 + ph - 58;
+        boolean winMenuClicked = clicked && state == GameState.WIN &&
+                cx >= winMenuX && cx <= winMenuX + 200 &&
+                cy >= winMenuY && cy <= winMenuY + 42;
+
+        if (enterPressed || mainMenuClicked || winMenuClicked) {
             input.consumeClick();
             saveData.save();
-            endlessMode = false;
-            state = GameState.MENU;
-            audio.playMenuMusic();
+            endlessMode  = false;
             enterPressed = false;
-        } else if (playAgain && state == GameState.GAME_OVER) {
+            state        = GameState.MENU;
+            audio.playMenuMusic();
+
+        } else if (playAgainClicked) {
             input.consumeClick();
             saveData.save();
             if (endlessMode) {
                 startEndlessMode();
             } else {
                 newGame();
-                state = GameState.TRANSITION;
+                state          = GameState.TRANSITION;
                 transitionTimer = TRANSITION_DURATION;
             }
         }
     }
 
-    void updateTransition() { if (--transitionTimer <= 0) state = GameState.PLAYING; }
+    void updateTransition() {
+        if (--transitionTimer <= 0) {
+            state = GameState.PLAYING;
+            System.out.println("[DEBUG] Transition complete, entering PLAYING state");
+        }
+    }
 
-    // ── Endless tick ─────────────────────────────────────────────
     void updateEndless() {
         if (player == null || !player.alive) {
             saveData.highScore = Math.max(saveData.highScore, player != null ? player.score : 0);
-            // Do NOT touch saveData.level — that belongs to story mode
             saveData.save();
             state = GameState.GAME_OVER; return;
         }
@@ -469,7 +507,6 @@ public class GamePanel extends JPanel implements ActionListener {
         tickGameplay(GameState.ENDLESS);
     }
 
-    // ── Upgrade select tick ──────────────────────────────────────
     void updateUpgradeSelect() {
         powerUps.setHover(input.mouseX, input.mouseY);
         if (input.mouseClicked) {
@@ -479,7 +516,6 @@ public class GamePanel extends JPanel implements ActionListener {
         }
     }
 
-    // ── Story tick ───────────────────────────────────────────────
     void updatePlaying() {
         if (player == null || !player.alive) {
             saveData.highScore = Math.max(saveData.highScore, player != null ? player.score : 0);
@@ -488,25 +524,19 @@ public class GamePanel extends JPanel implements ActionListener {
         tickGameplay(GameState.PLAYING);
     }
 
-    // ── Shared gameplay tick ─────────────────────────────────────
     void tickGameplay(GameState mode) {
-        // Aim
         aimAngle = getAimAngle();
         if (player != null) player.facingRight = (Math.cos(aimAngle) >= 0);
 
-        // Enemy under cursor
         enemyUnderCursor = false;
         float wmx = worldMouseX(), wmy = worldMouseY();
 
-        // Rebuild spatial grid every frame (cheap for <30 enemies)
         rebuildSpatialGrid();
 
-        // Check enemy under cursor using grid
         List<Enemy> nearCursor = nearbyEnemies(wmx, wmy, 80);
         for (Enemy en : nearCursor)
             if (en.alive && en.getBounds().contains(wmx, wmy)) { enemyUnderCursor = true; break; }
 
-        // Player movement
         boolean dashJust = input.isDash() && player.dashCooldown <= 0;
         player.update(input.isUp(), input.isDown(), input.isLeft(), input.isRight(),
                 dashJust, currentLevel);
@@ -516,7 +546,6 @@ public class GamePanel extends JPanel implements ActionListener {
                 particles.emit(player.x, player.y, C_BLUE, 6, 6);
         }
 
-        // Shooting
         if (shootCooldown > 0) shootCooldown--;
         if (input.isAttack() && shootCooldown <= 0) {
             float frM     = powerUps != null ? powerUps.fireRateMulti : 1f;
@@ -533,17 +562,14 @@ public class GamePanel extends JPanel implements ActionListener {
                 particles.emit(player.x, player.y, pc, 2, 4);
         }
 
-        // Projectile updates — pool iteration, no allocation
         for (Projectile p : projPool.all()) {
             if (!p.active) continue;
             p.update();
             if (!p.active) continue;
 
-            // ── Finite range check ───────────────────────────────
             float pdx = p.x - p.spawnX, pdy = p.y - p.spawnY;
             if (pdx*pdx + pdy*pdy > (float)PROJ_MAX_RANGE * PROJ_MAX_RANGE) {
                 p.active = false;
-                // Small puff at range limit
                 if (settings.quality == Quality.HIGH)
                     particles.emit(p.x, p.y, C_PHIT, 3, 3);
                 continue;
@@ -557,7 +583,6 @@ public class GamePanel extends JPanel implements ActionListener {
             }
 
             if (p.fromPlayer) {
-                // Use spatial grid: only check enemies near the projectile
                 List<Enemy> nearby = nearbyEnemies(p.x, p.y, 80);
                 handlePlayerProjectile(p, nearby);
             } else {
@@ -570,7 +595,6 @@ public class GamePanel extends JPanel implements ActionListener {
             }
         }
 
-        // Enemy AI — throttled by quality setting
         aiThrottleFrame++;
         List<Enemy> enemies = currentLevel.enemies;
         int eCount = enemies.size();
@@ -585,7 +609,6 @@ public class GamePanel extends JPanel implements ActionListener {
                 projPool.acquire(ep.x, ep.y, ep.x + ep.vx * 50, ep.y + ep.vy * 50,
                         ep.damage, false, ec, 1f, false, false, 0);
             }
-            // Grunt melee
             if (en.type == EnemyType.GRUNT && en.getBounds().intersects(player.getBounds())) {
                 if (player.invincibleTimer <= 0) {
                     player.takeDamage(en.damage);
@@ -596,7 +619,6 @@ public class GamePanel extends JPanel implements ActionListener {
             }
         }
 
-        // Pickups — iterator, no copy
         Iterator<Pickup> pkIt = currentLevel.pickups.iterator();
         while (pkIt.hasNext()) {
             Pickup pk = pkIt.next();
@@ -619,10 +641,7 @@ public class GamePanel extends JPanel implements ActionListener {
             }
         }
 
-        // Exit check — story mode ONLY, guarded by endlessMode flag
         if (mode == GameState.PLAYING && !endlessMode && !currentLevel.exitReached) {
-            // Only allow exit after 5 seconds (300 frames) of gameplay
-            // This prevents instant level skip on spawn-near-exit levels
             exitFrameCount++;
             if (exitFrameCount > 300) {
                 float edx = player.x - currentLevel.exitX, edy = player.y - currentLevel.exitY;
@@ -640,7 +659,6 @@ public class GamePanel extends JPanel implements ActionListener {
         ui.update();
     }
 
-    /** Handle player projectile vs enemy — uses pre-filtered nearby list. */
     void handlePlayerProjectile(Projectile p, List<Enemy> nearby) {
         for (Enemy en : nearby) {
             if (!en.alive || !en.getBounds().intersects(p.getBounds())) continue;
@@ -650,15 +668,12 @@ public class GamePanel extends JPanel implements ActionListener {
             audio.hit();
 
             if (powerUps != null) {
-                // Knockback
                 if (powerUps.knockback) {
                     float dx = en.x - player.x, dy = en.y - player.y;
                     float d  = (float)Math.sqrt(dx*dx + dy*dy);
                     if (d > 0) { en.x += dx/d*12; en.y += dy/d*12; }
                 }
-                // Freeze
                 if (powerUps.freezeOnHit) en.speed = Math.max(0.2f, en.speed * 0.3f);
-                // Chain lightning — use grid for nearest
                 if (powerUps.chainLightning) {
                     Enemy nearest = null; float minD = 200;
                     for (Enemy e2 : nearbyEnemies(en.x, en.y, 200)) {
@@ -672,7 +687,6 @@ public class GamePanel extends JPanel implements ActionListener {
                         particles.emit(nearest.x, nearest.y, C_CHAIN, 5, 6);
                     }
                 }
-                // Explosive AoE — use grid
                 if (p.explosive) {
                     for (Enemy e2 : nearbyEnemies(p.x, p.y, 80)) {
                         if (e2 == en || !e2.alive) continue;
@@ -729,22 +743,19 @@ public class GamePanel extends JPanel implements ActionListener {
         int ox    = (pw - drawW) / 2;
         int oy    = (ph - drawH) / 2;
 
-        // Black letterbox bars
         g.setColor(Color.BLACK);
         g.fillRect(0, 0, pw, ph);
 
-        // Apply transform so game renders in 960x640 logical space
+        g.setClip(ox, oy, drawW, drawH);
+
         g.translate(ox, oy);
         if (sc != 1f) g.scale(sc, sc);
 
-        // Update input coordinate mapping
         input.setScale(sc, ox, oy);
 
-        // Render game content
         renderFrame(g);
     }
 
-    /** All rendering — called with a 960x640 logical Graphics2D context. */
     public void paintGame(Graphics2D g) { renderFrame(g); }
 
     private void renderFrame(Graphics2D g) {
@@ -780,8 +791,11 @@ public class GamePanel extends JPanel implements ActionListener {
     void drawGameBase(Graphics2D g, boolean endless) {
         if (currentLevel == null) return;
         int cx = camera.getX(), cy = camera.getY();
+
+        // Draw level tiles
         currentLevel.draw(g, cx, cy, settings);
 
+        // Draw pickups and particles
         g.translate(-cx, -cy);
         currentLevel.pickups.forEach(pk -> pk.draw(g));
         particles.draw(g);
@@ -794,32 +808,38 @@ public class GamePanel extends JPanel implements ActionListener {
             en.draw(g, settings);
         }
 
-        // Draw active projectiles (pool)
+        // Draw active projectiles
         for (Projectile p : projPool.all()) {
             if (!p.active) continue;
-            // Skip if off-screen
             if (p.x-cx<-20||p.x-cx>SCREEN_W+20||p.y-cy<-20||p.y-cy>SCREEN_H+20) continue;
             p.draw(g, settings);
         }
 
+        // Draw player
         if (player != null) player.draw(g, settings);
         g.translate(cx, cy);
 
-        // ── Unified lighting pass (circular, no square artefacts) ──
+        // LIGHTING PASS - Using ShadowRenderer directly
         if (player != null && settings.quality != Quality.LOW) {
             int spx = (int)(player.x - cx);
             int spy = (int)(player.y - cy);
+
+            Shape oldClip = g.getClip();
+            Composite oldComposite = g.getComposite();
+            g.setClip(null);
+
             ShadowRenderer.drawLightingPass(g, spx, spy,
                     currentLevel.enemies, cx, cy, settings.quality);
+
+            g.setClip(oldClip);
+            g.setComposite(oldComposite);
         }
 
-        // Aim indicator (only when actually playing)
+        // Draw UI elements
         if (state == GameState.PLAYING || state == GameState.ENDLESS) drawAimIndicator(g);
         if (player != null) ui.drawHUD(g, player, currentLevel, endless ? -1 : levelNum);
         if (endless) drawEndlessHUD(g);
         if (powerUps != null) powerUps.drawActiveHUD(g);
-
-        // Vignette removed — ShadowRenderer darkness covers edge darkening
     }
 
     void drawEndlessHUD(Graphics2D g) {
@@ -840,7 +860,6 @@ public class GamePanel extends JPanel implements ActionListener {
         }
     }
 
-    // ── Aim indicator ────────────────────────────────────────────
     void drawAimIndicator(Graphics2D g) {
         if (player == null) return;
         crosshairPulse++;
@@ -852,10 +871,8 @@ public class GamePanel extends JPanel implements ActionListener {
         if (enemyUnderCursor) lc = C_RED;
         int lr=lc.getRed(), lg=lc.getGreen(), lb=lc.getBlue();
 
-        // Dashed aim line
         float dx=msx-spx, dy=msy-spy;
         float dist=(float)Math.sqrt(dx*dx+dy*dy);
-        // Clamp line to finite range
         float maxLinePx = PROJ_MAX_RANGE;
         float lineDist  = Math.min(dist, maxLinePx);
         if (lineDist > 4) {
@@ -869,7 +886,6 @@ public class GamePanel extends JPanel implements ActionListener {
                 g.setStroke(STR_DASH);
                 g.drawLine((int)(spx+nx*t0),(int)(spy+ny*t0),(int)(spx+nx*t1),(int)(spy+ny*t1));
             }
-            // Range limit marker — small X at max range
             if (dist > maxLinePx) {
                 float ex2=spx+nx*maxLinePx, ey2=spy+ny*maxLinePx;
                 g.setColor(new Color(lr,lg,lb,100));
@@ -879,7 +895,6 @@ public class GamePanel extends JPanel implements ActionListener {
             }
         }
 
-        // Crosshair
         float pulse=(float)(Math.sin(crosshairPulse*0.15)*0.15+1.0);
         int cr=(int)(10*pulse);
         if (settings.quality==Quality.HIGH){g.setColor(new Color(lr,lg,lb,35));g.fillOval(msx-cr*2,msy-cr*2,cr*4,cr*4);}
@@ -893,7 +908,6 @@ public class GamePanel extends JPanel implements ActionListener {
         g.drawLine(msx+cr+gap,msy,msx+cr+gap+tl,msy);
         g.setColor(new Color(255,255,255,190)); g.fillOval(msx-2,msy-2,4,4);
 
-        // Trajectory preview (80px)
         float tx0=spx+(float)Math.cos(aimAngle)*22, ty0=spy+(float)Math.sin(aimAngle)*22;
         float tx1=spx+(float)Math.cos(aimAngle)*80, ty1=spy+(float)Math.sin(aimAngle)*80;
         g.setColor(new Color(lr,lg,lb,55)); g.setStroke(STR_TRAJ);
@@ -901,16 +915,33 @@ public class GamePanel extends JPanel implements ActionListener {
         g.setStroke(STR_DEF);
     }
 
-    // ── Multiplayer Menu ─────────────────────────────────────────
+    // ================================================================
+    //  FIXED showMultiplayerMenu() - properly switches back to GamePanel
+    // ================================================================
     void showMultiplayerMenu() {
         JFrame frame = ownerFrame != null ? ownerFrame
                 : (JFrame) javax.swing.SwingUtilities.getWindowAncestor(this);
         if (frame == null) return;
 
+        // Keep reference to this GamePanel so we can add it back later
+        GamePanel self = this;
+
         MultiplayerMenu mp = new MultiplayerMenu(db, frame, () -> {
-            newGame();
-            state = GameState.TRANSITION;
-            transitionTimer = TRANSITION_DURATION;
+            // This runs when server sends START — put GamePanel back in frame
+            javax.swing.SwingUtilities.invokeLater(() -> {
+                frame.getContentPane().removeAll();
+                frame.getContentPane().add(self);
+                frame.revalidate();
+                frame.repaint();
+                self.requestFocusInWindow();
+
+                // Now start the actual game
+                newGame();
+                state = GameState.TRANSITION;
+                transitionTimer = TRANSITION_DURATION;
+
+                System.out.println("[GamePanel] Switched back from lobby — game starting");
+            });
         });
 
         frame.getContentPane().removeAll();
@@ -920,7 +951,6 @@ public class GamePanel extends JPanel implements ActionListener {
         mp.requestFocusInWindow();
     }
 
-    // ── Settings click handler ────────────────────────────────────
     void handleSettingsClick() {
         if (!input.mouseClicked) return;
         int cx=input.clickX, cy=input.clickY;
@@ -928,7 +958,8 @@ public class GamePanel extends JPanel implements ActionListener {
         for (int i=0;i<3;i++) {
             if (cx>=60+i*120&&cx<=160+i*120&&cy>=120&&cy<=150) {
                 settings.quality=qs[i]; settings.save();
-                applyQualitySettings(); ShadowRenderer.invalidateCache();
+                applyQualitySettings();
+                ShadowRenderer.invalidateCache();
                 audio.menuClick(); input.consumeClick(); return;
             }
         }
@@ -966,6 +997,4 @@ public class GamePanel extends JPanel implements ActionListener {
         ShadowRenderer.invalidateCache();
         SwingUtilities.invokeLater(this::requestFocusInWindow);
     }
-
-    // getVignetteImage removed — ShadowRenderer handles edge darkening
 }
