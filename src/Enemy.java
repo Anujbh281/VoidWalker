@@ -118,7 +118,8 @@ public class Enemy {
         return projs;
     }
 
-    void takeDamage(int dmg, ParticleSystem ps) {
+    // FIXED: Changed parameter from ParticleSystem to OptimizedParticleSystem
+    void takeDamage(int dmg, OptimizedParticleSystem ps) {
         hp -= dmg;
         Color c = type == EnemyType.BOSS ? new Color(255,0,100) : new Color(255,80,80);
         ps.emit(x, y, c, 6, 6);

@@ -26,11 +26,12 @@ public class GamePanel extends JPanel implements ActionListener {
     Player         player;
     Level          currentLevel;
     Camera         camera;
-    ParticleSystem particles;
+    OptimizedParticleSystem particles;
     UIManager      ui;
     MenuSystem     menu;
     InputHandler   input;
     AudioManager   audio;
+    PerformanceManager perf = new PerformanceManager();
 
     int     levelNum        = 1;
     int     transitionTimer = 0;
@@ -107,7 +108,7 @@ public class GamePanel extends JPanel implements ActionListener {
         settings  = Settings.load();
         saveData  = SaveData.load();
         camera    = new Camera();
-        particles = new ParticleSystem();
+        particles = new OptimizedParticleSystem();
         ui        = new UIManager();
         menu      = new MenuSystem();
         audio     = new AudioManager();
@@ -123,6 +124,7 @@ public class GamePanel extends JPanel implements ActionListener {
             @Override public void keyPressed(KeyEvent e) {
                 int k = e.getKeyCode();
                 if (k == KeyEvent.VK_ENTER) enterPressed = true;
+                if (k == KeyEvent.VK_F3) perf.toggleDebug();
                 if ((state==GameState.HELP || state==GameState.SETTINGS)
                         && k == KeyEvent.VK_ESCAPE) { audio.menuClick(); state = GameState.MENU; }
                 if ((state==GameState.PLAYING || state==GameState.ENDLESS)
@@ -188,7 +190,7 @@ public class GamePanel extends JPanel implements ActionListener {
         camera        = new Camera();
         camera.x      = player.x - SCREEN_W / 2f;
         camera.y      = player.y - SCREEN_H / 2f;
-        particles     = new ParticleSystem(); particles.applyQuality(settings.quality);
+        particles     = new OptimizedParticleSystem(); particles.applyQuality(settings.quality);
         projPool.clear(); shootCooldown = 0;
         spatialGrid.clear();
         exitFrameCount = 0;
@@ -217,7 +219,7 @@ public class GamePanel extends JPanel implements ActionListener {
         camera = new Camera();
         camera.x = player.x - SCREEN_W / 2f;
         camera.y = player.y - SCREEN_H / 2f;
-        particles = new ParticleSystem(); particles.applyQuality(settings.quality);
+        particles = new OptimizedParticleSystem(); particles.applyQuality(settings.quality);
         projPool.clear(); shootCooldown = 0;
         spatialGrid.clear();
         exitFrameCount = 0;
@@ -236,7 +238,7 @@ public class GamePanel extends JPanel implements ActionListener {
         camera          = new Camera();
         camera.x        = player.x - SCREEN_W / 2f;
         camera.y        = player.y - SCREEN_H / 2f;
-        particles       = new ParticleSystem(); particles.applyQuality(settings.quality);
+        particles       = new OptimizedParticleSystem(); particles.applyQuality(settings.quality);
         projPool.clear(); shootCooldown = 0;
         spatialGrid.clear();
         waveNumber      = 0;
@@ -337,6 +339,8 @@ public class GamePanel extends JPanel implements ActionListener {
     @Override public void actionPerformed(ActionEvent e) { update(); repaint(); }
 
     void update() {
+        perf.updateStart();
+
         switch (state) {
             case MENU, HELP, SETTINGS, UPGRADE_SELECT, GAME_OVER, WIN, PAUSED -> showCursor();
             case PLAYING, ENDLESS -> hideCursor();
@@ -354,6 +358,8 @@ public class GamePanel extends JPanel implements ActionListener {
             case HELP, SETTINGS -> {}
         }
         if (enterPressed) enterPressed = false;
+
+        perf.updateEnd();
     }
 
     void updateMenu() {
@@ -645,7 +651,11 @@ public class GamePanel extends JPanel implements ActionListener {
             exitFrameCount++;
             if (exitFrameCount > 300) {
                 float edx = player.x - currentLevel.exitX, edy = player.y - currentLevel.exitY;
-                if (Math.sqrt(edx*edx + edy*edy) < 48 && currentLevel.allEnemiesDead()) {
+                // Also require exit is far enough from spawn to prevent instant completion
+                float sdx = currentLevel.exitX - currentLevel.spawnX;
+                float sdy = currentLevel.exitY - currentLevel.spawnY;
+                boolean exitValid = (sdx*sdx + sdy*sdy) > (Level.TILE * 4) * (Level.TILE * 4);
+                if (Math.sqrt(edx*edx + edy*edy) < 48 && currentLevel.allEnemiesDead() && exitValid) {
                     currentLevel.exitReached = true;
                     ui.addFloatText(SCREEN_W/2f-80, SCREEN_H/2f,
                             "FLOOR CLEARED!", new Color(100,255,160));
@@ -657,6 +667,12 @@ public class GamePanel extends JPanel implements ActionListener {
         camera.follow(player.x, player.y, currentLevel);
         particles.update();
         ui.update();
+
+        // Update performance stats for debug overlay
+        perf.statEnemies = currentLevel.enemies.size();
+        perf.statParticles = particles.getCount();
+        perf.statBullets = 0;
+        perf.statLights = 0;
     }
 
     void handlePlayerProjectile(Projectile p, List<Enemy> nearby) {
@@ -729,6 +745,8 @@ public class GamePanel extends JPanel implements ActionListener {
 
     // ── Rendering ────────────────────────────────────────────────
     @Override protected void paintComponent(Graphics g2) {
+        perf.renderStart();
+
         super.paintComponent(g2);
         Graphics2D g = (Graphics2D) g2;
         g.setRenderingHint(RenderingHints.KEY_RENDERING,    RenderingHints.VALUE_RENDER_SPEED);
@@ -754,6 +772,11 @@ public class GamePanel extends JPanel implements ActionListener {
         input.setScale(sc, ox, oy);
 
         renderFrame(g);
+
+        // Draw performance debug overlay (if visible)
+        perf.drawDebug(g, settings);
+
+        perf.renderEnd();
     }
 
     public void paintGame(Graphics2D g) { renderFrame(g); }
@@ -798,7 +821,7 @@ public class GamePanel extends JPanel implements ActionListener {
         // Draw pickups and particles
         g.translate(-cx, -cy);
         currentLevel.pickups.forEach(pk -> pk.draw(g));
-        particles.draw(g);
+        particles.draw(g, cx, cy);
 
         // Viewport culling for enemies
         int vx1=cx-64, vx2=cx+SCREEN_W+64, vy1=cy-64, vy2=cy+SCREEN_H+64;
@@ -915,19 +938,14 @@ public class GamePanel extends JPanel implements ActionListener {
         g.setStroke(STR_DEF);
     }
 
-    // ================================================================
-    //  FIXED showMultiplayerMenu() - properly switches back to GamePanel
-    // ================================================================
     void showMultiplayerMenu() {
         JFrame frame = ownerFrame != null ? ownerFrame
                 : (JFrame) javax.swing.SwingUtilities.getWindowAncestor(this);
         if (frame == null) return;
 
-        // Keep reference to this GamePanel so we can add it back later
         GamePanel self = this;
 
         MultiplayerMenu mp = new MultiplayerMenu(db, frame, () -> {
-            // This runs when server sends START — put GamePanel back in frame
             javax.swing.SwingUtilities.invokeLater(() -> {
                 frame.getContentPane().removeAll();
                 frame.getContentPane().add(self);
@@ -935,7 +953,6 @@ public class GamePanel extends JPanel implements ActionListener {
                 frame.repaint();
                 self.requestFocusInWindow();
 
-                // Now start the actual game
                 newGame();
                 state = GameState.TRANSITION;
                 transitionTimer = TRANSITION_DURATION;

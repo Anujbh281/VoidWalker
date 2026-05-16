@@ -246,13 +246,15 @@ public class Level {
     }
 
     // ── BSP dungeon generation ────────────────────────────────────
+    // FIXED: Added deterministic seed using levelNum
     void generate() {
         rows = 17; cols = 24;
         tiles = new int[rows][cols];
         for (int[] row : tiles) Arrays.fill(row, VOID);
 
+        // Use levelNum as seed so each floor is always valid and deterministic
         List<int[]> rooms = new ArrayList<>();
-        generateRooms(rooms, new Random(), 1, 1, cols-2, rows-2, 0);
+        generateRooms(rooms, new Random(levelNum * 12345L), 1, 1, cols-2, rows-2, 0);
 
         for (int[] r : rooms)
             for (int y = r[1]; y < r[1]+r[3]; y++)
@@ -358,6 +360,9 @@ public class Level {
         }
     }
 
+    // ================================================================
+    //  FIXED generateRooms() - Proper BSP room generation
+    // ================================================================
     void generateRooms(List<int[]> rooms, Random rng, int x, int y, int w, int h, int depth) {
         int MIN = 5;
         // Base case: too small to split, or max depth reached
