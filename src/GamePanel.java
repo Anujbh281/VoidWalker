@@ -143,8 +143,7 @@ public class GamePanel extends JPanel implements ActionListener {
         gameTimer = new Timer(FRAME_TIME, this);
         gameTimer.start();
 
-        // Match FPS to monitor refresh rate
-        SwingUtilities.invokeLater(() -> framePacer.matchRefreshRate());
+        // REMOVED: framePacer.matchRefreshRate() - was causing slowdown
 
         // Check hardware acceleration status
         GraphicsConfiguration gc = GraphicsEnvironment
@@ -378,7 +377,7 @@ public class GamePanel extends JPanel implements ActionListener {
         }
         if (enterPressed) enterPressed = false;
 
-        framePacer.markUpdateDone();
+        // REMOVED: framePacer.markUpdateDone() - was causing slowdown
         perf.updateEnd();
     }
 
@@ -763,8 +762,8 @@ public class GamePanel extends JPanel implements ActionListener {
     }
 
     // ── Rendering ────────────────────────────────────────────────
+    // REMOVED: framePacer.beginFrame() and framePacer.endFrame() - were blocking EDT
     @Override protected void paintComponent(Graphics g2) {
-        framePacer.beginFrame();
         perf.renderStart();
 
         super.paintComponent(g2);
@@ -797,7 +796,6 @@ public class GamePanel extends JPanel implements ActionListener {
         perf.drawDebug(g, settings);
 
         perf.renderEnd();
-        framePacer.endFrame();
     }
 
     public void paintGame(Graphics2D g) { renderFrame(g); }
