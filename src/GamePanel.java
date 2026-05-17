@@ -18,6 +18,9 @@ public class GamePanel extends JPanel implements ActionListener {
     Timer      gameTimer;
     JFrame     ownerFrame = null;  // set by VoidWalker
     DatabaseManager db = null;   // set by VoidWalker after login
+    FullscreenManager fsManager = null;   // initialized in VoidWalker
+    FramePacer        framePacer = new FramePacer(60);
+    GraphicsSettings  gfxSettings = GraphicsSettings.load();
     GameState  state     = GameState.MENU;
     GameState  prevState = GameState.MENU;
 
@@ -139,6 +142,22 @@ public class GamePanel extends JPanel implements ActionListener {
 
         gameTimer = new Timer(FRAME_TIME, this);
         gameTimer.start();
+
+        // Match FPS to monitor refresh rate
+        SwingUtilities.invokeLater(() -> framePacer.matchRefreshRate());
+
+        // Check hardware acceleration status
+        GraphicsConfiguration gc = GraphicsEnvironment
+                .getLocalGraphicsEnvironment()
+                .getDefaultScreenDevice()
+                .getDefaultConfiguration();
+        BufferedImage testImg = gc.createCompatibleImage(1, 1);
+        boolean hwOk = testImg.getCapabilities(gc).isAccelerated();
+        System.out.println("[GamePanel] HW Acceleration: " + hwOk);
+        if (!hwOk) {
+            System.out.println("[GamePanel] WARNING: Software rendering active!");
+            System.out.println("[GamePanel] Add JVM flag: -Dsun.java2d.d3d=true");
+        }
 
         BufferedImage blank = new BufferedImage(16, 16, BufferedImage.TYPE_INT_ARGB);
         invisibleCursor = Toolkit.getDefaultToolkit().createCustomCursor(blank, new Point(0,0), "blank");
@@ -359,6 +378,7 @@ public class GamePanel extends JPanel implements ActionListener {
         }
         if (enterPressed) enterPressed = false;
 
+        framePacer.markUpdateDone();
         perf.updateEnd();
     }
 
@@ -651,7 +671,6 @@ public class GamePanel extends JPanel implements ActionListener {
             exitFrameCount++;
             if (exitFrameCount > 300) {
                 float edx = player.x - currentLevel.exitX, edy = player.y - currentLevel.exitY;
-                // Also require exit is far enough from spawn to prevent instant completion
                 float sdx = currentLevel.exitX - currentLevel.spawnX;
                 float sdy = currentLevel.exitY - currentLevel.spawnY;
                 boolean exitValid = (sdx*sdx + sdy*sdy) > (Level.TILE * 4) * (Level.TILE * 4);
@@ -745,6 +764,7 @@ public class GamePanel extends JPanel implements ActionListener {
 
     // ── Rendering ────────────────────────────────────────────────
     @Override protected void paintComponent(Graphics g2) {
+        framePacer.beginFrame();
         perf.renderStart();
 
         super.paintComponent(g2);
@@ -777,6 +797,7 @@ public class GamePanel extends JPanel implements ActionListener {
         perf.drawDebug(g, settings);
 
         perf.renderEnd();
+        framePacer.endFrame();
     }
 
     public void paintGame(Graphics2D g) { renderFrame(g); }
@@ -938,6 +959,9 @@ public class GamePanel extends JPanel implements ActionListener {
         g.setStroke(STR_DEF);
     }
 
+    // ================================================================
+    //  FIXED showMultiplayerMenu() - Fixed white screen issue
+    // ================================================================
     void showMultiplayerMenu() {
         JFrame frame = ownerFrame != null ? ownerFrame
                 : (JFrame) javax.swing.SwingUtilities.getWindowAncestor(this);
@@ -946,18 +970,30 @@ public class GamePanel extends JPanel implements ActionListener {
         GamePanel self = this;
 
         MultiplayerMenu mp = new MultiplayerMenu(db, frame, () -> {
+            // Called when multiplayer game starts
             javax.swing.SwingUtilities.invokeLater(() -> {
                 frame.getContentPane().removeAll();
                 frame.getContentPane().add(self);
                 frame.revalidate();
                 frame.repaint();
                 self.requestFocusInWindow();
-
                 newGame();
                 state = GameState.TRANSITION;
                 transitionTimer = TRANSITION_DURATION;
+            });
+        });
 
-                System.out.println("[GamePanel] Switched back from lobby — game starting");
+        // Store reference so back button can restore GamePanel
+        mp.setOnBack(() -> {
+            javax.swing.SwingUtilities.invokeLater(() -> {
+                frame.getContentPane().removeAll();
+                frame.getContentPane().add(self);
+                frame.revalidate();
+                frame.repaint();
+                self.requestFocusInWindow();
+                // Make sure game timer is running and state is MENU
+                state = GameState.MENU;
+                if (!gameTimer.isRunning()) gameTimer.start();
             });
         });
 
@@ -968,27 +1004,9 @@ public class GamePanel extends JPanel implements ActionListener {
         mp.requestFocusInWindow();
     }
 
-    void handleSettingsClick() {
-        if (!input.mouseClicked) return;
-        int cx=input.clickX, cy=input.clickY;
-        Quality[] qs={Quality.LOW,Quality.MEDIUM,Quality.HIGH};
-        for (int i=0;i<3;i++) {
-            if (cx>=60+i*120&&cx<=160+i*120&&cy>=120&&cy<=150) {
-                settings.quality=qs[i]; settings.save();
-                applyQualitySettings();
-                ShadowRenderer.invalidateCache();
-                audio.menuClick(); input.consumeClick(); return;
-            }
-        }
-        int dy=220;
-        if (cx>=60&&cx<=190&&cy>=dy-20&&cy<=dy+10&&settings.fullScreen)  { settings.fullScreen=false; settings.save(); applyDisplayMode(); audio.menuClick(); input.consumeClick(); return; }
-        if (cx>=220&&cx<=350&&cy>=dy-20&&cy<=dy+10&&!settings.fullScreen) { settings.fullScreen=true;  settings.save(); applyDisplayMode(); audio.menuClick(); input.consumeClick(); return; }
-        if (cy > SCREEN_H-80) {
-            state = (prevState == GameState.PAUSED) ? GameState.PAUSED : GameState.MENU;
-            input.consumeClick();
-        }
-    }
-
+    // ================================================================
+    //  FIXED applyDisplayMode() - Safer fullscreen handling
+    // ================================================================
     void applyDisplayMode() {
         JFrame frame = ownerFrame != null ? ownerFrame
                 : (JFrame) SwingUtilities.getWindowAncestor(this);
@@ -996,22 +1014,97 @@ public class GamePanel extends JPanel implements ActionListener {
 
         GraphicsDevice gd = GraphicsEnvironment.getLocalGraphicsEnvironment()
                 .getDefaultScreenDevice();
+
         if (settings.fullScreen) {
-            frame.dispose();
-            frame.setUndecorated(true);
-            frame.setVisible(true);
-            gd.setFullScreenWindow(frame);
+            // Use FullscreenManager if available, otherwise fallback
+            if (fsManager != null) {
+                fsManager.enterFullscreen();
+                input.setScale(fsManager.getScale(),
+                        fsManager.getDrawX(),
+                        fsManager.getDrawY());
+            } else {
+                // Fallback: simple exclusive fullscreen
+                frame.dispose();
+                frame.setUndecorated(true);
+                frame.setVisible(true);
+                gd.setFullScreenWindow(frame);
+            }
         } else {
-            gd.setFullScreenWindow(null);
-            frame.dispose();
-            frame.setUndecorated(false);
-            frame.setResizable(false);
-            setPreferredSize(new Dimension(SCREEN_W, SCREEN_H));
-            frame.pack();
-            frame.setLocationRelativeTo(null);
-            frame.setVisible(true);
+            // Exit fullscreen
+            if (fsManager != null) {
+                fsManager.exitFullscreen(SCREEN_W, SCREEN_H);
+                input.setScale(1f, 0, 0);
+            } else {
+                gd.setFullScreenWindow(null);
+                frame.dispose();
+                frame.setUndecorated(false);
+                frame.setResizable(false);
+                setPreferredSize(new Dimension(SCREEN_W, SCREEN_H));
+                frame.pack();
+                frame.setLocationRelativeTo(null);
+                frame.setVisible(true);
+            }
         }
+
         ShadowRenderer.invalidateCache();
-        SwingUtilities.invokeLater(this::requestFocusInWindow);
+        SwingUtilities.invokeLater(() -> {
+            requestFocusInWindow();
+            frame.toFront();
+        });
+    }
+
+    // ================================================================
+    //  FIXED handleSettingsClick() - Fullscreen button now works
+    // ================================================================
+    void handleSettingsClick() {
+        if (!input.mouseClicked) return;
+        int cx = input.clickX, cy = input.clickY;
+
+        // Quality buttons (row 1)
+        Quality[] qs = {Quality.LOW, Quality.MEDIUM, Quality.HIGH};
+        for (int i = 0; i < 3; i++) {
+            if (cx>=60+i*120 && cx<=160+i*120 && cy>=100 && cy<=155) {
+                settings.quality = qs[i];
+                settings.save();
+                applyQualitySettings();
+                ShadowRenderer.invalidateCache();
+                audio.menuClick();
+                input.consumeClick();
+                return;
+            }
+        }
+
+        // Display mode buttons (row 2) — WINDOWED / FULLSCREEN
+        // These are drawn at y=220 with h=30, so hit area is y=200 to y=230
+        if (cy >= 200 && cy <= 235) {
+            if (cx >= 60 && cx <= 190) {
+                // WINDOWED clicked
+                if (settings.fullScreen) {
+                    settings.fullScreen = false;
+                    settings.save();
+                    applyDisplayMode();
+                    audio.menuClick();
+                }
+                input.consumeClick();
+                return;
+            }
+            if (cx >= 220 && cx <= 350) {
+                // FULLSCREEN clicked
+                if (!settings.fullScreen) {
+                    settings.fullScreen = true;
+                    settings.save();
+                    applyDisplayMode();
+                    audio.menuClick();
+                }
+                input.consumeClick();
+                return;
+            }
+        }
+
+        // Back / close settings
+        if (cy > SCREEN_H - 80) {
+            state = (prevState == GameState.PAUSED) ? GameState.PAUSED : GameState.MENU;
+            input.consumeClick();
+        }
     }
 }

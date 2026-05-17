@@ -22,6 +22,7 @@ public class MultiplayerMenu extends JPanel {
     private final DatabaseManager         db;
     private final JFrame                  frame;
     private final Runnable                onGameStart;
+    private       Runnable                onBack = null;
     private       GameClient              client;
 
     public MultiplayerMenu(DatabaseManager db, JFrame frame, Runnable onGameStart) {
@@ -30,6 +31,8 @@ public class MultiplayerMenu extends JPanel {
         this.onGameStart = onGameStart;
         buildUI();
     }
+
+    public void setOnBack(Runnable r) { this.onBack = r; }
 
     private void buildUI() {
         setLayout(new GridBagLayout());
@@ -104,12 +107,17 @@ public class MultiplayerMenu extends JPanel {
         });
 
         backBtn.addActionListener(e -> {
-            // Remove this panel and go back — parent handles this
-            Container parent = getParent();
-            if (parent != null) {
-                parent.remove(this);
-                parent.revalidate();
-                parent.repaint();
+            // Call onBack callback if set (GamePanel restores itself)
+            if (onBack != null) {
+                onBack.run();
+            } else {
+                // Fallback: remove from parent
+                Container parent = getParent();
+                if (parent != null) {
+                    parent.remove(this);
+                    parent.revalidate();
+                    parent.repaint();
+                }
             }
         });
 
