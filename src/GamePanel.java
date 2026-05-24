@@ -35,6 +35,12 @@ public class GamePanel extends JPanel implements ActionListener {
     InputHandler   input;
     AudioManager   audio;
     PerformanceManager perf = new PerformanceManager();
+    KeybindManager keybinds  = KeybindManager.load();
+    PauseMenu      pauseMenu = null;  // initialized in startGame()
+
+    // Cached keybind keys for fast array access (no HashMap lookups per frame)
+    private int KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_DASH, KEY_ABILITY, KEY_PAUSE;
+    private int lastMouseX = -1, lastMouseY = -1;
 
     int     levelNum        = 1;
     int     transitionTimer = 0;
@@ -116,6 +122,15 @@ public class GamePanel extends JPanel implements ActionListener {
         menu      = new MenuSystem();
         audio     = new AudioManager();
         input     = new InputHandler(settings);
+        pauseMenu = new PauseMenu(keybinds, settings, audio);
+        pauseMenu.onResume   = () -> {};
+        pauseMenu.onMainMenu = () -> { endlessMode = false; state = GameState.MENU; audio.playMenuMusic(); };
+        pauseMenu.onExit     = () -> System.exit(0);
+        pauseMenu.onApplyGfx = this::applyDisplayMode;
+
+        // Cache keybind keys for fast access
+        cacheKeybinds();
+        pauseMenu.onKeybindChanged = this::cacheKeybinds;
 
         applyQualitySettings();
 
@@ -123,27 +138,35 @@ public class GamePanel extends JPanel implements ActionListener {
         addMouseListener(input);
         addMouseMotionListener(input);
 
+        // Mouse listeners for pause menu are now handled in update() via input.mouseDown
+        // No separate MouseAdapter/MouseMotionAdapter added here to avoid duplicate events
+
         addKeyListener(new KeyAdapter() {
             @Override public void keyPressed(KeyEvent e) {
                 int k = e.getKeyCode();
                 if (k == KeyEvent.VK_ENTER) enterPressed = true;
                 if (k == KeyEvent.VK_F3) perf.toggleDebug();
+
+                // Let PauseMenu handle ESC and rebinding first
+                if (pauseMenu != null && pauseMenu.handleKey(k)) return;
+
                 if ((state==GameState.HELP || state==GameState.SETTINGS)
                         && k == KeyEvent.VK_ESCAPE) { audio.menuClick(); state = GameState.MENU; }
+
                 if ((state==GameState.PLAYING || state==GameState.ENDLESS)
-                        && k == settings.pauseKey) { prevState = state; state = GameState.PAUSED; }
-                if (state==GameState.PAUSED && k == settings.pauseKey)
-                    state = (prevState == GameState.ENDLESS ? GameState.ENDLESS : GameState.PLAYING);
+                        && k == KEY_PAUSE) {
+                    pauseMenu.toggle();
+                }
+
                 if ((state==GameState.PLAYING || state==GameState.ENDLESS)
-                        && k == settings.interactKey && player != null)
+                        && k == KEY_ABILITY && player != null) {
                     player.activateAbility();
+                }
             }
         });
 
         gameTimer = new Timer(FRAME_TIME, this);
         gameTimer.start();
-
-        // REMOVED: framePacer.matchRefreshRate() - was causing slowdown
 
         // Check hardware acceleration status
         GraphicsConfiguration gc = GraphicsEnvironment
@@ -162,6 +185,16 @@ public class GamePanel extends JPanel implements ActionListener {
         invisibleCursor = Toolkit.getDefaultToolkit().createCustomCursor(blank, new Point(0,0), "blank");
         defaultCursor   = Cursor.getDefaultCursor();
         setCursor(defaultCursor);
+    }
+
+    void cacheKeybinds() {
+        KEY_UP     = keybinds.getKey(KeybindManager.KeyAction.MOVE_UP);
+        KEY_DOWN   = keybinds.getKey(KeybindManager.KeyAction.MOVE_DOWN);
+        KEY_LEFT   = keybinds.getKey(KeybindManager.KeyAction.MOVE_LEFT);
+        KEY_RIGHT  = keybinds.getKey(KeybindManager.KeyAction.MOVE_RIGHT);
+        KEY_DASH   = keybinds.getKey(KeybindManager.KeyAction.DASH);
+        KEY_ABILITY= keybinds.getKey(KeybindManager.KeyAction.ABILITY);
+        KEY_PAUSE  = keybinds.getKey(KeybindManager.KeyAction.PAUSE);
     }
 
     void showCursor() {
@@ -223,9 +256,13 @@ public class GamePanel extends JPanel implements ActionListener {
         levelNum++;
 
         if (levelNum > 10) {
-            state = GameState.WIN;
             saveData.highScore = Math.max(saveData.highScore, sc);
-            saveData.level = 1; saveData.save(); return;
+            saveData.level = 1;
+            saveData.score = 0;
+            saveData.save();
+            state = GameState.WIN;
+            audio.playMenuMusic();
+            return;
         }
         saveData.level = levelNum; saveData.score = sc;
         saveData.totalKills += kc; saveData.save();
@@ -359,6 +396,42 @@ public class GamePanel extends JPanel implements ActionListener {
     void update() {
         perf.updateStart();
 
+        // Pause menu handling
+        if (pauseMenu != null && pauseMenu.isOpen()) {
+            showCursor();
+
+            // Throttle hover detection - only update when mouse moves or animating
+            if (input.mouseX != lastMouseX || input.mouseY != lastMouseY) {
+                pauseMenu.update(input.mouseX, input.mouseY);
+                lastMouseX = input.mouseX;
+                lastMouseY = input.mouseY;
+            } else if (pauseMenu.isAnimating()) {
+                pauseMenu.update(input.mouseX, input.mouseY);
+            }
+
+            // Handle click for buttons
+            if (input.mouseClicked) {
+                pauseMenu.handleClick(input.clickX, input.clickY);
+                input.consumeClick();
+            }
+
+            // Handle slider drag (using input.mouseDown)
+            if (input.mouseDown) {
+                pauseMenu.handleMouseDrag(input.mouseX, input.mouseY);
+            } else {
+                pauseMenu.handleMouseRelease();
+            }
+
+            // Handle mouse press for sliders
+            if (input.mouseClicked) {
+                pauseMenu.handleMousePress(input.clickX, input.clickY);
+            }
+
+            if (enterPressed) enterPressed = false;
+            perf.updateEnd();
+            return;  // freeze all game logic while paused
+        }
+
         switch (state) {
             case MENU, HELP, SETTINGS, UPGRADE_SELECT, GAME_OVER, WIN, PAUSED -> showCursor();
             case PLAYING, ENDLESS -> hideCursor();
@@ -370,14 +443,12 @@ public class GamePanel extends JPanel implements ActionListener {
             case PLAYING        -> updatePlaying();
             case ENDLESS        -> updateEndless();
             case UPGRADE_SELECT -> updateUpgradeSelect();
-            case PAUSED         -> updatePaused();
             case GAME_OVER, WIN -> updateEndScreen();
             case TRANSITION     -> updateTransition();
             case HELP, SETTINGS -> {}
         }
         if (enterPressed) enterPressed = false;
 
-        // REMOVED: framePacer.markUpdateDone() - was causing slowdown
         perf.updateEnd();
     }
 
@@ -480,7 +551,7 @@ public class GamePanel extends JPanel implements ActionListener {
                 cy >= playAgainY && cy <= playAgainY + 42;
 
         int winMenuX = SCREEN_W/2 - 100;
-        int winMenuY = py2 + ph - 58;
+        int winMenuY = SCREEN_H/2 - 180 + 302;
         boolean winMenuClicked = clicked && state == GameState.WIN &&
                 cx >= winMenuX && cx <= winMenuX + 200 &&
                 cy >= winMenuY && cy <= winMenuY + 42;
@@ -562,10 +633,15 @@ public class GamePanel extends JPanel implements ActionListener {
         for (Enemy en : nearCursor)
             if (en.alive && en.getBounds().contains(wmx, wmy)) { enemyUnderCursor = true; break; }
 
-        boolean dashJust = input.isDash() && player.dashCooldown <= 0;
-        player.update(input.isUp(), input.isDown(), input.isLeft(), input.isRight(),
-                dashJust, currentLevel);
-        if (dashJust && player.dashing) {
+        // Use cached keybind keys for fast array access (no HashMap lookups)
+        boolean up    = input.keys[KEY_UP]    || input.keys[KeyEvent.VK_UP];
+        boolean down  = input.keys[KEY_DOWN]  || input.keys[KeyEvent.VK_DOWN];
+        boolean left  = input.keys[KEY_LEFT]  || input.keys[KeyEvent.VK_LEFT];
+        boolean right = input.keys[KEY_RIGHT] || input.keys[KeyEvent.VK_RIGHT];
+        boolean dash  = input.keys[KEY_DASH];
+
+        player.update(up, down, left, right, dash && player.dashCooldown <= 0, currentLevel);
+        if (dash && player.dashCooldown <= 0 && player.dashing) {
             audio.dash();
             if (settings.quality != Quality.LOW)
                 particles.emit(player.x, player.y, C_BLUE, 6, 6);
@@ -762,7 +838,6 @@ public class GamePanel extends JPanel implements ActionListener {
     }
 
     // ── Rendering ────────────────────────────────────────────────
-    // REMOVED: framePacer.beginFrame() and framePacer.endFrame() - were blocking EDT
     @Override protected void paintComponent(Graphics g2) {
         perf.renderStart();
 
@@ -814,7 +889,11 @@ public class GamePanel extends JPanel implements ActionListener {
                 if (endlessMode) drawEndless(g); else drawGame(g);
                 menu.drawGameOver(g, player, endlessMode ? waveNumber : levelNum, saveData);
             }
-            case WIN            -> { drawGame(g); menu.drawWin(g, player, levelNum, saveData); }
+            case WIN -> {
+                if (currentLevel != null) drawGame(g);
+                else { g.setColor(Color.BLACK); g.fillRect(0,0,SCREEN_W,SCREEN_H); }
+                menu.drawWin(g, player, levelNum, saveData);
+            }
             case HELP           -> menu.drawHelp(g);
             case SETTINGS       -> menu.drawSettings(g, settings, input.mouseX, input.mouseY);
             case TRANSITION     -> {
@@ -825,6 +904,11 @@ public class GamePanel extends JPanel implements ActionListener {
             }
         }
         if (state == GameState.SETTINGS) handleSettingsClick();
+
+        // Draw pause menu overlay on top of everything
+        if (pauseMenu != null && pauseMenu.isOpen()) {
+            pauseMenu.draw(g);
+        }
     }
 
     void drawGame(Graphics2D g)    { drawGameBase(g, false); }
@@ -891,7 +975,12 @@ public class GamePanel extends JPanel implements ActionListener {
         String wt = "WAVE  " + waveNumber;
         FontMetrics fm = g.getFontMetrics();
         g.drawString(wt, SCREEN_W/2 - fm.stringWidth(wt)/2, 26);
-        int alive = (int)currentLevel.enemies.stream().filter(e->e.alive).count();
+
+        // FIXED: Replace stream().filter() with fast for loop
+        int alive = 0;
+        for (int i = 0; i < currentLevel.enemies.size(); i++)
+            if (currentLevel.enemies.get(i).alive) alive++;
+
         g.setFont(F_SM); g.setColor(new Color(200,150,150));
         String et = alive + " enemies remaining";
         g.drawString(et, SCREEN_W/2 - g.getFontMetrics().stringWidth(et)/2, 42);
@@ -957,9 +1046,6 @@ public class GamePanel extends JPanel implements ActionListener {
         g.setStroke(STR_DEF);
     }
 
-    // ================================================================
-    //  FIXED showMultiplayerMenu() - Fixed white screen issue
-    // ================================================================
     void showMultiplayerMenu() {
         JFrame frame = ownerFrame != null ? ownerFrame
                 : (JFrame) javax.swing.SwingUtilities.getWindowAncestor(this);
@@ -968,7 +1054,6 @@ public class GamePanel extends JPanel implements ActionListener {
         GamePanel self = this;
 
         MultiplayerMenu mp = new MultiplayerMenu(db, frame, () -> {
-            // Called when multiplayer game starts
             javax.swing.SwingUtilities.invokeLater(() -> {
                 frame.getContentPane().removeAll();
                 frame.getContentPane().add(self);
@@ -981,7 +1066,6 @@ public class GamePanel extends JPanel implements ActionListener {
             });
         });
 
-        // Store reference so back button can restore GamePanel
         mp.setOnBack(() -> {
             javax.swing.SwingUtilities.invokeLater(() -> {
                 frame.getContentPane().removeAll();
@@ -989,7 +1073,6 @@ public class GamePanel extends JPanel implements ActionListener {
                 frame.revalidate();
                 frame.repaint();
                 self.requestFocusInWindow();
-                // Make sure game timer is running and state is MENU
                 state = GameState.MENU;
                 if (!gameTimer.isRunning()) gameTimer.start();
             });
@@ -1002,9 +1085,6 @@ public class GamePanel extends JPanel implements ActionListener {
         mp.requestFocusInWindow();
     }
 
-    // ================================================================
-    //  FIXED applyDisplayMode() - Safer fullscreen handling
-    // ================================================================
     void applyDisplayMode() {
         JFrame frame = ownerFrame != null ? ownerFrame
                 : (JFrame) SwingUtilities.getWindowAncestor(this);
@@ -1014,21 +1094,18 @@ public class GamePanel extends JPanel implements ActionListener {
                 .getDefaultScreenDevice();
 
         if (settings.fullScreen) {
-            // Use FullscreenManager if available, otherwise fallback
             if (fsManager != null) {
                 fsManager.enterFullscreen();
                 input.setScale(fsManager.getScale(),
                         fsManager.getDrawX(),
                         fsManager.getDrawY());
             } else {
-                // Fallback: simple exclusive fullscreen
                 frame.dispose();
                 frame.setUndecorated(true);
                 frame.setVisible(true);
                 gd.setFullScreenWindow(frame);
             }
         } else {
-            // Exit fullscreen
             if (fsManager != null) {
                 fsManager.exitFullscreen(SCREEN_W, SCREEN_H);
                 input.setScale(1f, 0, 0);
@@ -1051,14 +1128,10 @@ public class GamePanel extends JPanel implements ActionListener {
         });
     }
 
-    // ================================================================
-    //  FIXED handleSettingsClick() - Fullscreen button now works
-    // ================================================================
     void handleSettingsClick() {
         if (!input.mouseClicked) return;
         int cx = input.clickX, cy = input.clickY;
 
-        // Quality buttons (row 1)
         Quality[] qs = {Quality.LOW, Quality.MEDIUM, Quality.HIGH};
         for (int i = 0; i < 3; i++) {
             if (cx>=60+i*120 && cx<=160+i*120 && cy>=100 && cy<=155) {
@@ -1072,11 +1145,8 @@ public class GamePanel extends JPanel implements ActionListener {
             }
         }
 
-        // Display mode buttons (row 2) — WINDOWED / FULLSCREEN
-        // These are drawn at y=220 with h=30, so hit area is y=200 to y=230
         if (cy >= 200 && cy <= 235) {
             if (cx >= 60 && cx <= 190) {
-                // WINDOWED clicked
                 if (settings.fullScreen) {
                     settings.fullScreen = false;
                     settings.save();
@@ -1087,7 +1157,6 @@ public class GamePanel extends JPanel implements ActionListener {
                 return;
             }
             if (cx >= 220 && cx <= 350) {
-                // FULLSCREEN clicked
                 if (!settings.fullScreen) {
                     settings.fullScreen = true;
                     settings.save();
@@ -1099,7 +1168,6 @@ public class GamePanel extends JPanel implements ActionListener {
             }
         }
 
-        // Back / close settings
         if (cy > SCREEN_H - 80) {
             state = (prevState == GameState.PAUSED) ? GameState.PAUSED : GameState.MENU;
             input.consumeClick();

@@ -6,6 +6,7 @@ public class InputHandler extends KeyAdapter
         implements MouseListener, MouseMotionListener {
 
     Set<Integer> held = new HashSet<>();
+    public boolean[] keys = new boolean[512];  // ADDED: public key state array for fast access
     int mouseX, mouseY;
     boolean mouseClicked = false;
     boolean mouseDown    = false;
@@ -26,8 +27,14 @@ public class InputHandler extends KeyAdapter
     private int tx(int x) { return scale == 1f ? x : Math.round((x - offX) / scale); }
     private int ty(int y) { return scale == 1f ? y : Math.round((y - offY) / scale); }
 
-    @Override public void keyPressed(KeyEvent e)  { held.add(e.getKeyCode()); }
-    @Override public void keyReleased(KeyEvent e) { held.remove(e.getKeyCode()); }
+    @Override public void keyPressed(KeyEvent e)  {
+        held.add(e.getKeyCode());
+        if (e.getKeyCode() >= 0 && e.getKeyCode() < 512) keys[e.getKeyCode()] = true;  // ADDED
+    }
+    @Override public void keyReleased(KeyEvent e) {
+        held.remove(e.getKeyCode());
+        if (e.getKeyCode() >= 0 && e.getKeyCode() < 512) keys[e.getKeyCode()] = false; // ADDED
+    }
 
     boolean isUp()       { return held.contains(settings.upKey); }
     boolean isDown()     { return held.contains(settings.downKey); }

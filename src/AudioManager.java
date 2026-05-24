@@ -19,6 +19,10 @@ public class AudioManager {
     Clip shootClip      = null;
     Clip currentLoop    = null;
 
+    // Volume controls
+    private float masterVolume = 1.0f;
+    private float musicVolume  = 1.0f;
+
     public AudioManager() {
         menuMusicClip  = loadClip("assets/audio/menu_music.wav");
         levelMusicClip = loadClip("assets/audio/level_music.wav");
@@ -58,6 +62,16 @@ public class AudioManager {
         currentLoop = null;
     }
 
+    // ── Volume control methods ───────────────────────────────────
+    public void setMasterVolume(float v) {
+        this.masterVolume = Math.max(0f, Math.min(1f, v));
+        // Optionally apply to clips here if you use FloatControl
+    }
+
+    public void setMusicVolume(float v) {
+        this.musicVolume = Math.max(0f, Math.min(1f, v));
+    }
+
     // ── Public API ────────────────────────────────────────────────
 
     public void playMenuMusic() {
@@ -66,7 +80,7 @@ public class AudioManager {
                 && menuMusicClip.isRunning()) return;
         stopLoop();
         if (menuMusicClip != null) {
-            setVolume(menuMusicClip, 0.6f);
+            setVolume(menuMusicClip, 0.6f * masterVolume * musicVolume);
             menuMusicClip.setFramePosition(0);
             menuMusicClip.loop(Clip.LOOP_CONTINUOUSLY);
             currentLoop = menuMusicClip;
@@ -79,7 +93,7 @@ public class AudioManager {
                 && levelMusicClip.isRunning()) return;
         stopLoop();
         if (levelMusicClip != null) {
-            setVolume(levelMusicClip, 0.55f);
+            setVolume(levelMusicClip, 0.55f * masterVolume * musicVolume);
             levelMusicClip.setFramePosition(0);
             levelMusicClip.loop(Clip.LOOP_CONTINUOUSLY);
             currentLoop = levelMusicClip;
@@ -93,24 +107,24 @@ public class AudioManager {
         if (shootClip != null) {
             shootClip.stop();
             shootClip.setFramePosition(0);
-            setVolume(shootClip, 0.7f);
+            setVolume(shootClip, 0.7f * masterVolume);
             shootClip.start();
         } else {
-            playTone(800, 60, 0.12f);
+            playTone(800, 60, 0.12f * masterVolume);
         }
     }
 
     // ── Synthesized fallback SFX ──────────────────────────────────
-    public void hit()       { playTone(200,  80,  0.15f); }
-    public void death()     { playTone(150,  200, 0.18f); }
-    public void pickup()    { playTone(1200, 100, 0.10f); }
-    public void dash()      { playTone(600,  60,  0.08f); }
-    public void menuClick() { playTone(500,  80,  0.08f); }
+    public void hit()       { playTone(200,  80,  0.15f * masterVolume); }
+    public void death()     { playTone(150,  200, 0.18f * masterVolume); }
+    public void pickup()    { playTone(1200, 100, 0.10f * masterVolume); }
+    public void dash()      { playTone(600,  60,  0.08f * masterVolume); }
+    public void menuClick() { playTone(500,  80,  0.08f * masterVolume); }
     public void levelUp() {
-        playTone(880, 300, 0.15f);
+        playTone(880, 300, 0.15f * masterVolume);
         new Thread(() -> {
             try { Thread.sleep(200); } catch (Exception ignored) {}
-            playTone(1100, 300, 0.15f);
+            playTone(1100, 300, 0.15f * masterVolume);
         }).start();
     }
 
