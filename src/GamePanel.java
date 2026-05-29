@@ -38,6 +38,16 @@ public class GamePanel extends JPanel implements ActionListener {
     KeybindManager keybinds  = KeybindManager.load();
     PauseMenu      pauseMenu = null;  // initialized in startGame()
 
+    // CO-OP multiplayer fields (replace old mpClient/mpRenderer fields)
+    CoopGameClient  coopClient   = null;   // non-null when in co-op mode
+    CoopRenderer    coopRenderer = new CoopRenderer();
+    int             myPlayerId   = -1;
+    private int     mpShootGrace = 0;
+    private static final int MP_SHOOT_GRACE_FRAMES = 30;
+
+    // Enemy-under-cursor check (screen space, updated each frame)
+    private boolean enemyUnderCursorMP = false;
+
     // Cached keybind keys for fast array access (no HashMap lookups per frame)
     private int KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_DASH, KEY_ABILITY, KEY_PAUSE;
     private int lastMouseX = -1, lastMouseY = -1;
@@ -613,14 +623,92 @@ public class GamePanel extends JPanel implements ActionListener {
     }
 
     void updatePlaying() {
+        // In co-op, player object is null — server controls lives
+        if (coopClient != null && coopClient.isConnected()) {
+            tickGameplay(GameState.PLAYING);
+            return;
+        }
         if (player == null || !player.alive) {
-            saveData.highScore = Math.max(saveData.highScore, player != null ? player.score : 0);
-            saveData.save(); state = GameState.GAME_OVER; return;
+            saveData.highScore = Math.max(saveData.highScore,
+                    player != null ? player.score : 0);
+            saveData.save();
+            state = GameState.GAME_OVER;
+            return;
         }
         tickGameplay(GameState.PLAYING);
     }
 
     void tickGameplay(GameState mode) {
+        // ── CO-OP MULTIPLAYER ─────────────────────────────────────
+        if (coopClient != null && coopClient.isConnected()) {
+
+            // Update aim angle from mouse position
+            // aimAngle is in world space — same formula as singleplayer
+            float wmx = input.mouseX + camera.getX();
+            float wmy = input.mouseY + camera.getY();
+
+            // Find my player's world position for aimAngle calculation
+            GamePacket.PlayerState myState = coopClient.getMyState();
+            float myX = 480f, myY = 320f; // screen centre fallback
+            if (myState != null) {
+                float[] ipos = coopClient.getInterpolatedPlayerPos(myPlayerId);
+                myX = ipos[0]; myY = ipos[1];
+            }
+            float aimAngle = (float)Math.atan2(wmy - myY, wmx - myX);
+
+            // Enemy-under-cursor check for crosshair color
+            enemyUnderCursorMP = false;
+            GamePacket.EnemyState[] enemies = coopClient.getLatestEnemies();
+            if (enemies != null) {
+                for (GamePacket.EnemyState en : enemies) {
+                    if (!en.alive) continue;
+                    float dx = wmx - en.x, dy = wmy - en.y;
+                    if (dx*dx + dy*dy < 28*28) { enemyUnderCursorMP = true; break; }
+                }
+            }
+
+            // Camera follows MY player
+            if (myState != null && myState.alive) {
+                float[] ipos = coopClient.getInterpolatedPlayerPos(myPlayerId);
+                camera.x = ipos[0] - SCREEN_W / 2f;
+                camera.y = ipos[1] - SCREEN_H / 2f;
+                // Clamp camera to level
+                if (currentLevel != null) {
+                    camera.x = Math.max(0, Math.min(currentLevel.widthPx()  - SCREEN_W,  camera.x));
+                    camera.y = Math.max(0, Math.min(currentLevel.heightPx() - SCREEN_H, camera.y));
+                }
+            }
+
+            // Set input fields on client (sent to server at 20Hz)
+            coopClient.inUp    = input.keys[KEY_UP]    || input.keys[java.awt.event.KeyEvent.VK_UP];
+            coopClient.inDown  = input.keys[KEY_DOWN]  || input.keys[java.awt.event.KeyEvent.VK_DOWN];
+            coopClient.inLeft  = input.keys[KEY_LEFT]  || input.keys[java.awt.event.KeyEvent.VK_LEFT];
+            coopClient.inRight = input.keys[KEY_RIGHT] || input.keys[java.awt.event.KeyEvent.VK_RIGHT];
+            coopClient.inDash  = input.keys[KEY_DASH];
+
+            // Shoot — grace period prevents auto-fire on spawn
+            if (mpShootGrace > 0) {
+                mpShootGrace--;
+                coopClient.inShoot = false;
+            } else {
+                coopClient.inShoot = input.mouseDown && !pauseMenu.isOpen();
+            }
+
+            coopClient.inAimAngle   = aimAngle;
+            coopClient.inMouseWorldX = wmx;   // world-space mouse for crosshair sync
+            coopClient.inMouseWorldY = wmy;
+
+            // Particles / camera shake for singleplayer are skipped in MP
+            // (server handles damage, client just renders)
+            particles.update();
+            ui.update();
+            perf.statEnemies   = (enemies != null) ? enemies.length : 0;
+            perf.statBullets   = 0;
+            perf.statParticles = particles.getCount();
+            return; // skip ALL singleplayer simulation
+        }
+
+        // ── SINGLEPLAYER ─────────────────────────────────────────
         aimAngle = getAimAngle();
         if (player != null) player.facingRight = (Math.cos(aimAngle) >= 0);
 
@@ -633,6 +721,7 @@ public class GamePanel extends JPanel implements ActionListener {
         for (Enemy en : nearCursor)
             if (en.alive && en.getBounds().contains(wmx, wmy)) { enemyUnderCursor = true; break; }
 
+        // Send input to server each frame when multiplayer is active
         // Use cached keybind keys for fast array access (no HashMap lookups)
         boolean up    = input.keys[KEY_UP]    || input.keys[KeyEvent.VK_UP];
         boolean down  = input.keys[KEY_DOWN]  || input.keys[KeyEvent.VK_DOWN];
@@ -887,7 +976,24 @@ public class GamePanel extends JPanel implements ActionListener {
             }
             case GAME_OVER -> {
                 if (endlessMode) drawEndless(g); else drawGame(g);
-                menu.drawGameOver(g, player, endlessMode ? waveNumber : levelNum, saveData);
+                if (player != null) {
+                    menu.drawGameOver(g, player,
+                            endlessMode ? waveNumber : levelNum, saveData);
+                } else {
+                    // Co-op game over — no local player object
+                    g.setColor(new Color(0, 0, 0, 185));
+                    g.fillRect(0, 0, SCREEN_W, SCREEN_H);
+                    g.setColor(new Color(220, 70, 70));
+                    g.setFont(new Font("Monospaced", Font.BOLD, 30));
+                    String msg = "GAME OVER";
+                    FontMetrics fm = g.getFontMetrics();
+                    g.drawString(msg, SCREEN_W/2 - fm.stringWidth(msg)/2, SCREEN_H/2);
+                    g.setFont(new Font("Monospaced", Font.PLAIN, 14));
+                    g.setColor(new Color(200, 180, 255));
+                    String sub = "Press ENTER to return to menu";
+                    fm = g.getFontMetrics();
+                    g.drawString(sub, SCREEN_W/2 - fm.stringWidth(sub)/2, SCREEN_H/2 + 40);
+                }
             }
             case WIN -> {
                 if (currentLevel != null) drawGame(g);
@@ -918,54 +1024,106 @@ public class GamePanel extends JPanel implements ActionListener {
         if (currentLevel == null) return;
         int cx = camera.getX(), cy = camera.getY();
 
-        // Draw level tiles
+        // Draw tiles (same for SP and MP)
         currentLevel.draw(g, cx, cy, settings);
 
-        // Draw pickups and particles
         g.translate(-cx, -cy);
-        currentLevel.pickups.forEach(pk -> pk.draw(g));
-        particles.draw(g, cx, cy);
 
-        // Viewport culling for enemies
-        int vx1=cx-64, vx2=cx+SCREEN_W+64, vy1=cy-64, vy2=cy+SCREEN_H+64;
-        for (Enemy en : currentLevel.enemies) {
-            if (!en.alive) continue;
-            if (en.x<vx1||en.x>vx2||en.y<vy1||en.y>vy2) continue;
-            en.draw(g, settings);
+        if (coopClient != null && coopClient.isConnected()) {
+            // ── MULTIPLAYER: draw from server state ───────────────
+            coopRenderer.drawWorld(g, cx, cy, coopClient, myPlayerId);
+        } else {
+            // ── SINGLEPLAYER: draw local objects ──────────────────
+            currentLevel.pickups.forEach(pk -> pk.draw(g));
+            particles.draw(g, cx, cy);
+
+            int vx1=cx-64, vx2=cx+SCREEN_W+64, vy1=cy-64, vy2=cy+SCREEN_H+64;
+            for (Enemy en : currentLevel.enemies) {
+                if (!en.alive) continue;
+                if (en.x<vx1||en.x>vx2||en.y<vy1||en.y>vy2) continue;
+                en.draw(g, settings);
+            }
+            for (Projectile p : projPool.all()) {
+                if (!p.active) continue;
+                if (p.x-cx<-20||p.x-cx>SCREEN_W+20) continue;
+                p.draw(g, settings);
+            }
+            if (player != null) player.draw(g, settings);
         }
 
-        // Draw active projectiles
-        for (Projectile p : projPool.all()) {
-            if (!p.active) continue;
-            if (p.x-cx<-20||p.x-cx>SCREEN_W+20||p.y-cy<-20||p.y-cy>SCREEN_H+20) continue;
-            p.draw(g, settings);
-        }
-
-        // Draw player
-        if (player != null) player.draw(g, settings);
         g.translate(cx, cy);
 
-        // LIGHTING PASS - Using ShadowRenderer directly
-        if (player != null && settings.quality != Quality.LOW) {
-            int spx = (int)(player.x - cx);
-            int spy = (int)(player.y - cy);
-
-            Shape oldClip = g.getClip();
-            Composite oldComposite = g.getComposite();
+        // ── LIGHTING ─────────────────────────────────────────────
+        if (settings.quality != Quality.LOW) {
+            Shape     oldClip = g.getClip();
+            Composite oldComp = g.getComposite();
             g.setClip(null);
 
-            ShadowRenderer.drawLightingPass(g, spx, spy,
-                    currentLevel.enemies, cx, cy, settings.quality);
+            if (coopClient != null && coopClient.isConnected()) {
+                // MP lighting: use MY player's screen position
+                GamePacket.PlayerState myState = coopClient.getMyState();
+                if (myState != null && myState.alive) {
+                    float[] ipos = coopClient.getInterpolatedPlayerPos(myPlayerId);
+                    int spx = (int)(ipos[0] - cx);
+                    int spy = (int)(ipos[1] - cy);
+
+                    // Build fake enemy list for ShadowRenderer
+                    java.util.List<Enemy> fakeEnemies = new java.util.ArrayList<>();
+                    GamePacket.EnemyState[] enemies = coopClient.getLatestEnemies();
+                    if (enemies != null) {
+                        for (GamePacket.EnemyState en : enemies) {
+                            if (!en.alive) continue;
+                            Enemy stub = new Enemy(en.x, en.y,
+                                    en.typeOrd == 2 ? EnemyType.BOSS : EnemyType.GRUNT);
+                            stub.alive = true;
+                            fakeEnemies.add(stub);
+                        }
+                    }
+                    ShadowRenderer.drawLightingPass(g, spx, spy,
+                            fakeEnemies, cx, cy, settings.quality);
+                }
+            } else if (player != null) {
+                int spx = (int)(player.x - cx);
+                int spy = (int)(player.y - cy);
+                ShadowRenderer.drawLightingPass(g, spx, spy,
+                        currentLevel.enemies, cx, cy, settings.quality);
+            }
 
             g.setClip(oldClip);
-            g.setComposite(oldComposite);
+            g.setComposite(oldComp);
         }
 
-        // Draw UI elements
-        if (state == GameState.PLAYING || state == GameState.ENDLESS) drawAimIndicator(g);
-        if (player != null) ui.drawHUD(g, player, currentLevel, endless ? -1 : levelNum);
-        if (endless) drawEndlessHUD(g);
-        if (powerUps != null) powerUps.drawActiveHUD(g);
+        // ── HUD ───────────────────────────────────────────────────
+        if (coopClient != null && coopClient.isConnected()) {
+            // MP HUD: player list, ping, wave
+            coopRenderer.drawHUD(g, coopClient.getLatestPlayers(),
+                    myPlayerId, coopClient.getPing(),
+                    coopClient.getLatestWave(), coopClient.getLatestLevel());
+
+            // Local crosshair (drawn in screen space)
+            coopRenderer.drawLocalCrosshair(g,
+                    input.mouseX, input.mouseY,
+                    coopClient.inAimAngle,
+                    enemyUnderCursorMP,
+                    1); // weaponLevel from server state if available
+
+            // Wave countdown overlay
+            drawCoopWaveHUD(g);
+
+        } else {
+            // SP HUD
+            if (state == GameState.PLAYING || state == GameState.ENDLESS)
+                drawAimIndicator(g);
+            if (player != null) ui.drawHUD(g, player, currentLevel,
+                    endless ? -1 : levelNum);
+            if (endless) drawEndlessHUD(g);
+            if (powerUps != null) powerUps.drawActiveHUD(g);
+        }
+    }
+
+    private void drawCoopWaveHUD(Graphics2D g) {
+        // Show "WAVE X" banner in center top (brief)
+        // Only shown when wave just started (track with a timer if desired)
     }
 
     void drawEndlessHUD(Graphics2D g) {
@@ -1053,16 +1211,36 @@ public class GamePanel extends JPanel implements ActionListener {
 
         GamePanel self = this;
 
-        MultiplayerMenu mp = new MultiplayerMenu(db, frame, () -> {
+        MultiplayerMenu mp = new MultiplayerMenu(db, frame, (client) -> {
             javax.swing.SwingUtilities.invokeLater(() -> {
                 frame.getContentPane().removeAll();
                 frame.getContentPane().add(self);
-                frame.revalidate();
-                frame.repaint();
+                frame.revalidate(); frame.repaint();
                 self.requestFocusInWindow();
-                newGame();
-                state = GameState.TRANSITION;
-                transitionTimer = TRANSITION_DURATION;
+
+                // Wire up the new CoopGameClient
+                self.coopClient  = client;
+                self.myPlayerId  = client.getPlayerId();
+                self.state       = GameState.PLAYING;
+
+                // Load tiles-only level for rendering
+                TextureFactory.preload(Level.TILE);
+                Level.loadBackground();
+                self.currentLevel = new Level(1, saveData);
+                self.camera       = new Camera();
+
+                // Centre camera on spawn point
+                self.camera.x = self.currentLevel.spawnX - SCREEN_W / 2f;
+                self.camera.y = self.currentLevel.spawnY - SCREEN_H / 2f;
+
+                // Reset input — prevent lobby click carrying into gameplay
+                self.input.mouseDown = false;
+                self.input.consumeClick();
+                java.util.Arrays.fill(self.input.keys, false);
+                self.mpShootGrace = MP_SHOOT_GRACE_FRAMES;
+
+                if (!gameTimer.isRunning()) gameTimer.start();
+                System.out.println("[GamePanel] Co-op started as P" + self.myPlayerId);
             });
         });
 
@@ -1070,18 +1248,18 @@ public class GamePanel extends JPanel implements ActionListener {
             javax.swing.SwingUtilities.invokeLater(() -> {
                 frame.getContentPane().removeAll();
                 frame.getContentPane().add(self);
-                frame.revalidate();
-                frame.repaint();
+                frame.revalidate(); frame.repaint();
                 self.requestFocusInWindow();
-                state = GameState.MENU;
+                self.state       = GameState.MENU;
+                self.coopClient  = null;
+                self.myPlayerId  = -1;
                 if (!gameTimer.isRunning()) gameTimer.start();
             });
         });
 
         frame.getContentPane().removeAll();
         frame.getContentPane().add(mp);
-        frame.revalidate();
-        frame.repaint();
+        frame.revalidate(); frame.repaint();
         mp.requestFocusInWindow();
     }
 

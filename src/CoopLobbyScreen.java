@@ -1,88 +1,95 @@
 import javax.swing.*;
-import java.awt.Component;
 import java.awt.*;
 import java.awt.event.*;
-import java.util.function.Consumer;
 
-public class LobbyScreen extends JPanel {
+/**
+ * CoopLobbyScreen — Pre-game lobby for co-op multiplayer.
+ *
+ * Shows connected players, chat, and host start controls.
+ * Uses CoopGameClient v2 public-field callbacks (no setters).
+ */
+public class CoopLobbyScreen extends JPanel {
 
-    private static final Color BG        = new Color(8,   6,  18);
-    private static final Color PANEL_BG  = new Color(15, 12, 30, 220);
-    private static final Color ACCENT    = new Color(120, 80, 255);
-    private static final Color TEXT      = new Color(200, 190, 255);
-    private static final Color GOLD      = new Color(255, 200,  60);
-    private static final Color GREEN     = new Color( 80, 220, 120);
+    private static final Color BG       = new Color(8,   6,  18);
+    private static final Color PANEL_BG = new Color(14, 11,  28, 225);
+    private static final Color ACCENT   = new Color(110, 70, 255);
+    private static final Color TEXT     = new Color(200, 190, 255);
+    private static final Color GOLD     = new Color(255, 200,  55);
+    private static final Color GREEN    = new Color( 75, 220, 120);
 
-    private final GameClient  client;
-    private final boolean     isHost;
-    private final String      username;
+    private final CoopGameClient client;
+    private final boolean        isHost;
+    private final String         username;
 
     private JPanel    playerListPanel;
     private JLabel    statusLabel;
-    private JLabel    ipLabel;
-    private JButton   startBtn;
     private JTextArea chatArea;
     private JTextField chatField;
+    private Runnable  onGameStart;
 
-    private Runnable onGameStart;
-
-    public LobbyScreen(GameClient client, boolean isHost, String username) {
+    public CoopLobbyScreen(CoopGameClient client, boolean isHost, String username) {
         this.client   = client;
         this.isHost   = isHost;
         this.username = username;
         buildUI();
-        setupCallbacks();
+        wireCallbacks();
     }
 
     public void setOnGameStart(Runnable r) { this.onGameStart = r; }
 
+    // ── Build UI ──────────────────────────────────────────────────
     private void buildUI() {
         setLayout(new BorderLayout(10, 10));
         setBackground(BG);
-        setBorder(BorderFactory.createEmptyBorder(20, 30, 20, 30));
+        setBorder(BorderFactory.createEmptyBorder(18, 28, 18, 28));
 
-        // ── TOP ──────────────────────────────────────────────
+        // ── TOP ──────────────────────────────────────────────────
         JPanel top = new JPanel(new BorderLayout());
         top.setOpaque(false);
-        JLabel title = label("VOIDWALKER  —  LOBBY", 22, ACCENT);
-        JLabel roleL = label("[" + (isHost?"HOST":"GUEST") + "] " + username, 13, GOLD);
+        JLabel title = lbl("VOIDWALKER  ─  CO-OP LOBBY", 21, ACCENT);
+        JLabel role  = lbl("[" + (isHost ? "HOST" : "GUEST") + "]  " + username, 12, GOLD);
         top.add(title, BorderLayout.WEST);
-        top.add(roleL, BorderLayout.EAST);
+        top.add(role,  BorderLayout.EAST);
 
-        ipLabel = label("Your IP: " + getLocalIP() +
-                "   |   Port: " + GameClient.PORT, 11, new Color(150,140,200));
-        JPanel topBox = new JPanel(new BorderLayout(0,4));
+        JLabel ipLine = lbl("Your IP: " + getLocalIP()
+                        + "   │   Port: " + CoopGameClient.PORT, 10,
+                new Color(145, 135, 195));
+        JPanel topBox = new JPanel(new BorderLayout(0, 3));
         topBox.setOpaque(false);
-        topBox.add(top,     BorderLayout.NORTH);
-        topBox.add(ipLabel, BorderLayout.SOUTH);
+        topBox.add(top,    BorderLayout.NORTH);
+        topBox.add(ipLine, BorderLayout.SOUTH);
 
-        // ── CENTRE ───────────────────────────────────────────
-        JPanel centre = new JPanel(new GridLayout(1, 2, 16, 0));
+        // ── CENTRE ───────────────────────────────────────────────
+        JPanel centre = new JPanel(new GridLayout(1, 2, 14, 0));
         centre.setOpaque(false);
 
-        JPanel leftBox = darkPanel("PLAYERS (0/4)");
-        playerListPanel = new JPanel(new GridLayout(4, 1, 0, 8));
+        // Left: player slots
+        JPanel leftBox  = darkPanel("PLAYERS  (0 / 4)");
+        playerListPanel = new JPanel(new GridLayout(4, 1, 0, 7));
         playerListPanel.setOpaque(false);
         for (int i = 1; i <= 4; i++) playerListPanel.add(emptySlot(i));
         leftBox.add(playerListPanel, BorderLayout.CENTER);
 
+        // Right: chat
         JPanel rightBox = darkPanel("CHAT");
         chatArea = new JTextArea();
         chatArea.setEditable(false);
-        chatArea.setBackground(new Color(10, 8, 20));
-        chatArea.setForeground(new Color(180, 170, 220));
+        chatArea.setBackground(new Color(9, 7, 18));
+        chatArea.setForeground(new Color(175, 165, 215));
         chatArea.setFont(new Font("Monospaced", Font.PLAIN, 12));
         chatArea.setLineWrap(true);
         chatArea.setWrapStyleWord(true);
         JScrollPane scroll = new JScrollPane(chatArea);
         scroll.setBorder(null);
+        scroll.setBackground(chatArea.getBackground());
 
         chatField = new JTextField();
-        chatField.setBackground(new Color(20, 15, 40));
+        chatField.setBackground(new Color(18, 14, 36));
         chatField.setForeground(Color.WHITE);
         chatField.setCaretColor(Color.WHITE);
         chatField.setFont(new Font("Monospaced", Font.PLAIN, 12));
-        chatField.setBorder(BorderFactory.createLineBorder(new Color(80, 60, 140)));
+        chatField.setBorder(BorderFactory.createLineBorder(new Color(75, 55, 130)));
+        chatField.setToolTipText("Press ENTER to send");
         chatField.addActionListener(e -> sendChat());
 
         rightBox.add(scroll,    BorderLayout.CENTER);
@@ -91,26 +98,29 @@ public class LobbyScreen extends JPanel {
         centre.add(leftBox);
         centre.add(rightBox);
 
-        // ── BOTTOM ───────────────────────────────────────────
+        // ── BOTTOM ───────────────────────────────────────────────
         JPanel bottom = new JPanel(new BorderLayout(10, 0));
         bottom.setOpaque(false);
-        statusLabel = label("Waiting for players...", 12, TEXT);
+        statusLabel = lbl("Waiting for players...", 12, TEXT);
 
         JPanel btnRow = new JPanel(new FlowLayout(FlowLayout.RIGHT, 10, 0));
         btnRow.setOpaque(false);
 
         if (isHost) {
-            JButton storyBtn   = actionButton("START  STORY",   new Color(60, 40, 140));
-            JButton endlessBtn = actionButton("START  ENDLESS", new Color(40, 80, 40));
+            JButton storyBtn   = actionBtn("▶  START  STORY",   new Color(50, 35, 130));
+            JButton endlessBtn = actionBtn("▶  START  ENDLESS", new Color(30, 75,  40));
             storyBtn.addActionListener(e   -> hostStart("story"));
             endlessBtn.addActionListener(e -> hostStart("endless"));
-            startBtn = storyBtn;
             btnRow.add(endlessBtn);
             btnRow.add(storyBtn);
         }
 
-        JButton leaveBtn = actionButton("LEAVE", new Color(80, 20, 20));
-        leaveBtn.addActionListener(e -> client.disconnect());
+        JButton leaveBtn = actionBtn("LEAVE", new Color(80, 20, 20));
+        leaveBtn.addActionListener(e -> {
+            client.disconnect();
+            Container p = getParent();
+            if (p != null) { p.remove(this); p.revalidate(); p.repaint(); }
+        });
         btnRow.add(leaveBtn);
 
         bottom.add(statusLabel, BorderLayout.WEST);
@@ -120,48 +130,48 @@ public class LobbyScreen extends JPanel {
         add(centre,  BorderLayout.CENTER);
         add(bottom,  BorderLayout.SOUTH);
 
-        appendChat("System", "Welcome to the lobby! Share your IP with friends.");
+        appendChat("System", "Welcome! Share your IP with friends to play co-op.");
         if (isHost) appendChat("System", "Press START when everyone is ready.");
         else        appendChat("System", "Waiting for the host to start...");
     }
 
-    // ── Wire callbacks using GameClient v2 public fields ─────────
-    private void setupCallbacks() {
-        // FIXED: Use public field callbacks instead of setter methods
+    // ── Wire CoopGameClient callbacks ─────────────────────────────
+    private void wireCallbacks() {
+        // Lobby update — player list changed
         client.onLobbyUpdate = pkt -> SwingUtilities.invokeLater(() -> {
             updatePlayerList(pkt);
             if (pkt.message != null) statusLabel.setText(pkt.message);
         });
 
+        // Chat message received
         client.onChat = pkt -> SwingUtilities.invokeLater(() ->
                 appendChat(pkt.username != null ? pkt.username : "?", pkt.message)
         );
 
+        // Game starting
         client.onGameStart = pkt -> SwingUtilities.invokeLater(() -> {
             appendChat("System", "Game starting! Mode: " + pkt.gameMode);
             if (onGameStart != null) onGameStart.run();
         });
 
+        // Error
         client.onError = pkt -> SwingUtilities.invokeLater(() -> {
-            statusLabel.setForeground(new Color(255, 80, 80));
+            statusLabel.setForeground(new Color(220, 60, 60));
             statusLabel.setText("Error: " + pkt.message);
         });
 
+        // Disconnected
         client.onDisconnected = () -> SwingUtilities.invokeLater(() -> {
-            statusLabel.setForeground(new Color(255, 80, 80));
+            statusLabel.setForeground(new Color(220, 60, 60));
             statusLabel.setText("Disconnected from server.");
         });
     }
 
+    // ── Update player list ────────────────────────────────────────
     private void updatePlayerList(GamePacket pkt) {
         playerListPanel.removeAll();
         GamePacket.PlayerState[] players = pkt.players;
         int count = players != null ? players.length : 0;
-
-        try {
-            ((TitledPanel) playerListPanel.getParent().getParent())
-                    .setTitle("PLAYERS (" + count + "/4)");
-        } catch (Exception ignored) {}
 
         for (int i = 0; i < 4; i++) {
             if (players != null && i < players.length) {
@@ -174,20 +184,22 @@ public class LobbyScreen extends JPanel {
         }
         playerListPanel.revalidate();
         playerListPanel.repaint();
+
+        // Update panel title with count
+        Component parent = playerListPanel.getParent();
+        if (parent instanceof TitledPanel tp)
+            tp.setTitle("PLAYERS  (" + count + " / 4)");
     }
 
-    // ── FIXED: sendChat uses GamePacket directly (no sendChat method) ──
+    // ── Send chat ─────────────────────────────────────────────────
     private void sendChat() {
         String msg = chatField.getText().trim();
         if (msg.isEmpty()) return;
-
-        // GameClient v2 has no sendChat() — build and send packet directly
-        GamePacket pkt = new GamePacket();
-        pkt.type     = GamePacket.TYPE_CHAT;
-        pkt.username = username;
-        pkt.message  = msg;
+        GamePacket pkt  = new GamePacket();
+        pkt.type        = GamePacket.TYPE_CHAT;
+        pkt.username    = username;
+        pkt.message     = msg;
         client.send(pkt);
-
         appendChat(username, msg);
         chatField.setText("");
     }
@@ -197,60 +209,62 @@ public class LobbyScreen extends JPanel {
         chatArea.setCaretPosition(chatArea.getDocument().getLength());
     }
 
+    // ── Host start ────────────────────────────────────────────────
     private void hostStart(String mode) {
         if (!client.isConnected()) {
-            statusLabel.setForeground(new Color(255, 80, 80));
-            statusLabel.setText("Not connected to server!"); return;
+            statusLabel.setForeground(new Color(220, 60, 60));
+            statusLabel.setText("Not connected!"); return;
         }
         if (client.getPlayerId() != 1) {
-            statusLabel.setForeground(new Color(255, 80, 80));
+            statusLabel.setForeground(new Color(220, 60, 60));
             statusLabel.setText("Only the host can start!"); return;
         }
-        statusLabel.setForeground(new Color(80, 255, 130));
-        statusLabel.setText("Starting " + mode + " game...");
+        statusLabel.setForeground(GREEN);
+        statusLabel.setText("Starting " + mode + "...");
         client.hostStartGame(mode);
     }
 
+    // ── UI helpers ────────────────────────────────────────────────
     private JPanel emptySlot(int num) {
         JPanel p = new JPanel(new BorderLayout());
-        p.setBackground(new Color(15, 12, 28));
+        p.setBackground(new Color(14, 11, 26));
         p.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(new Color(50, 40, 80), 1),
-                BorderFactory.createEmptyBorder(8, 12, 8, 12)));
-        p.add(label("Slot " + num + "  —  Empty", 13, new Color(80, 70, 120)));
+                BorderFactory.createLineBorder(new Color(48, 38, 76), 1),
+                BorderFactory.createEmptyBorder(7, 11, 7, 11)));
+        p.add(lbl("Slot " + num + "  —  Empty", 12, new Color(72, 62, 110)));
         return p;
     }
 
     private JPanel filledSlot(int id, String name, boolean isMe) {
         JPanel p = new JPanel(new BorderLayout());
-        Color border = isMe ? ACCENT : GREEN;
-        p.setBackground(new Color(20, 16, 36));
+        Color  border = isMe ? ACCENT : GREEN;
+        p.setBackground(new Color(18, 15, 34));
         p.setBorder(BorderFactory.createCompoundBorder(
                 BorderFactory.createLineBorder(border, isMe ? 2 : 1),
-                BorderFactory.createEmptyBorder(8, 12, 8, 12)));
+                BorderFactory.createEmptyBorder(7, 11, 7, 11)));
         String tag = (id == 1 ? " [HOST]" : "") + (isMe ? " [YOU]" : "");
-        p.add(label("P" + id + "  " + name + tag, 13, isMe ? GOLD : TEXT));
+        p.add(lbl("P" + id + "  " + name + tag, 12, isMe ? GOLD : TEXT));
         return p;
     }
 
     private JPanel darkPanel(String title) {
         TitledPanel p = new TitledPanel(title);
-        p.setLayout(new BorderLayout(0, 8));
+        p.setLayout(new BorderLayout(0, 7));
         p.setBackground(PANEL_BG);
         p.setBorder(BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(new Color(60, 50, 100), 1),
-                BorderFactory.createEmptyBorder(12, 12, 12, 12)));
+                BorderFactory.createLineBorder(new Color(58, 47, 96), 1),
+                BorderFactory.createEmptyBorder(11, 11, 11, 11)));
         return p;
     }
 
-    private JLabel label(String text, int size, Color color) {
+    private JLabel lbl(String text, int size, Color color) {
         JLabel l = new JLabel(text);
         l.setFont(new Font("Monospaced", Font.BOLD, size));
         l.setForeground(color);
         return l;
     }
 
-    private JButton actionButton(String text, Color bg) {
+    private JButton actionBtn(String text, Color bg) {
         JButton b = new JButton(text);
         b.setBackground(bg);
         b.setForeground(Color.WHITE);
@@ -266,17 +280,19 @@ public class LobbyScreen extends JPanel {
         catch (Exception e) { return "127.0.0.1"; }
     }
 
+    // ── TitledPanel ───────────────────────────────────────────────
     static class TitledPanel extends JPanel {
         private String title;
         TitledPanel(String t) { this.title = t; setOpaque(true); }
         void setTitle(String t) { this.title = t; repaint(); }
+
         @Override protected void paintComponent(Graphics g) {
             super.paintComponent(g);
-            g.setColor(new Color(120, 80, 255));
+            g.setColor(new Color(110, 70, 255));
             g.setFont(new Font("Monospaced", Font.BOLD, 11));
-            g.drawString(title, 12, 14);
-            g.setColor(new Color(60, 50, 100));
-            g.drawLine(12, 18, getWidth()-12, 18);
+            g.drawString(title, 11, 13);
+            g.setColor(new Color(58, 47, 96));
+            g.drawLine(11, 17, getWidth() - 11, 17);
         }
     }
 }

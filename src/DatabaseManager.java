@@ -1,271 +1,320 @@
 import java.sql.*;
 
 /**
- * DatabaseManager.java
- * Handles all MySQL database operations for VoidWalker.
- * Uses WAMP default credentials (root, no password).
+ * DatabaseManager — XAMPP/MySQL integration.
  *
- * REQUIRES: mysql-connector-j-X.X.X.jar in your project
- * Download: https://dev.mysql.com/downloads/connector/j/
+ * XAMPP DEFAULT CREDENTIALS:
+ *   Host     : localhost
+ *   Port     : 3306
+ *   Username : root
+ *   Password : (empty string)
+ *
+ * AUTO-SETUP:
+ *   - Creates database 'voidwalker_db' if missing
+ *   - Creates all tables if missing
+ *   - No manual SQL import needed
+ *
+ * USAGE:
+ *   DatabaseManager db = new DatabaseManager();
+ *   db.connect();
+ *   db.updateHighScore(userId, score);
  */
 public class DatabaseManager {
 
-    // ── WAMP default credentials ──────────────────────────────
-    private static final String HOST = "localhost";
-    private static final int    PORT = 3306;
-    private static final String DB   = "voidwalker_db";
-    private static final String USER = "root";
-    private static final String PASS = "";   // WAMP default = empty
+    // ── XAMPP credentials ─────────────────────────────────────────
+    private static final String HOST     = "localhost";
+    private static final int    PORT     = 3306;
+    private static final String DB_NAME  = "voidwalker_db";
+    private static final String USER     = "root";
+    private static final String PASSWORD = "";           // XAMPP default: empty
 
-    private static final String URL =
-            "jdbc:mysql://" + HOST + ":" + PORT + "/" + DB +
-                    "?useSSL=false&serverTimezone=UTC&allowPublicKeyRetrieval=true";
+    private static final String URL_NO_DB = "jdbc:mysql://" + HOST + ":" + PORT
+            + "/?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC";
+    private static final String URL       = "jdbc:mysql://" + HOST + ":" + PORT
+            + "/" + DB_NAME
+            + "?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC";
 
-    private Connection connection;
+    private Connection conn = null;
 
-    // ── Connect to MySQL ─────────────────────────────────────
+    // ─────────────────────────────────────────────────────────────
+    // Wrapper methods for VoidWalker compatibility
+    // ─────────────────────────────────────────────────────────────
+
+    public static class UserRecord {
+        public int userId;
+        public String username;
+        public int highScore;
+
+        public UserRecord(int userId, String username, int highScore) {
+            this.userId = userId;
+            this.username = username;
+            this.highScore = highScore;
+        }
+    }
+
+    public boolean registerUser(String username, String password) {
+        int result = register(username, password);
+        return result > 0;  // true if successful
+    }
+
+    public UserRecord loginUser(String username, String password) {
+        int userId = login(username, password);
+        if (userId > 0) {
+            return new UserRecord(userId, username, getHighScore(userId));
+        }
+        return null;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Connect — creates DB + tables automatically
+    // ─────────────────────────────────────────────────────────────
     public boolean connect() {
         try {
             Class.forName("com.mysql.cj.jdbc.Driver");
-            connection = DriverManager.getConnection(URL, USER, PASS);
-            System.out.println("[DB] Connected to MySQL successfully.");
+
+            // Step 1: connect without DB to create it if needed
+            try (Connection tmp = DriverManager.getConnection(URL_NO_DB, USER, PASSWORD);
+                 Statement  st  = tmp.createStatement()) {
+                st.executeUpdate("CREATE DATABASE IF NOT EXISTS " + DB_NAME
+                        + " CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci");
+                System.out.println("[DB] Database '" + DB_NAME + "' ready.");
+            }
+
+            // Step 2: connect to the database
+            conn = DriverManager.getConnection(URL, USER, PASSWORD);
+            System.out.println("[DB] Connected to MySQL via XAMPP.");
+
+            createTables();
             return true;
+
         } catch (ClassNotFoundException e) {
-            System.err.println("[DB] ERROR: MySQL JDBC Driver not found.");
-            System.err.println("     Download mysql-connector-j from:");
-            System.err.println("     https://dev.mysql.com/downloads/connector/j/");
-            return false;
+            System.err.println("[DB] mysql-connector-j.jar not found on classpath!");
+            System.err.println("[DB] Place it in: project_root/lib/mysql-connector-j.jar");
         } catch (SQLException e) {
-            System.err.println("[DB] ERROR: Cannot connect to MySQL.");
-            System.err.println("     Make sure WAMP is running and MySQL is started.");
-            System.err.println("     Details: " + e.getMessage());
-            return false;
+            System.err.println("[DB] Connection failed: " + e.getMessage());
+            System.err.println("[DB] Make sure XAMPP MySQL is running on port 3306.");
+        }
+        return false;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Create tables
+    // ─────────────────────────────────────────────────────────────
+    private void createTables() {
+        if (conn == null) return;
+        try (Statement st = conn.createStatement()) {
+
+            // Users / player profiles
+            st.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id         INT AUTO_INCREMENT PRIMARY KEY,
+                    username   VARCHAR(50) UNIQUE NOT NULL,
+                    password   VARCHAR(255) NOT NULL,
+                    high_score INT DEFAULT 0,
+                    total_kills INT DEFAULT 0,
+                    total_games INT DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB
+            """);
+
+            // Multiplayer match history
+            st.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS mp_matches (
+                    id          INT AUTO_INCREMENT PRIMARY KEY,
+                    mode        VARCHAR(20) NOT NULL,
+                    player_count INT NOT NULL,
+                    wave_reached INT DEFAULT 0,
+                    played_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                ) ENGINE=InnoDB
+            """);
+
+            // Per-player stats for each MP match
+            st.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS mp_player_stats (
+                    id         INT AUTO_INCREMENT PRIMARY KEY,
+                    match_id   INT NOT NULL,
+                    user_id    INT NOT NULL,
+                    score      INT DEFAULT 0,
+                    kills      INT DEFAULT 0,
+                    deaths     INT DEFAULT 0,
+                    FOREIGN KEY (match_id) REFERENCES mp_matches(id)
+                ) ENGINE=InnoDB
+            """);
+
+            // Settings per user
+            st.executeUpdate("""
+                CREATE TABLE IF NOT EXISTS user_settings (
+                    user_id    INT PRIMARY KEY,
+                    quality    VARCHAR(10) DEFAULT 'HIGH',
+                    fullscreen TINYINT DEFAULT 0,
+                    volume     FLOAT DEFAULT 1.0,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                ) ENGINE=InnoDB
+            """);
+
+            System.out.println("[DB] Tables verified/created.");
+
+        } catch (SQLException e) {
+            System.err.println("[DB] Table creation error: " + e.getMessage());
         }
     }
 
-    public void disconnect() {
+    // ─────────────────────────────────────────────────────────────
+    // Authentication
+    // ─────────────────────────────────────────────────────────────
+
+    /** Register new user. Returns user ID or -1 on failure, -2 if username taken. */
+    public int register(String username, String password) {
+        if (conn == null) return -1;
         try {
-            if (connection != null && !connection.isClosed()) {
-                connection.close();
-                System.out.println("[DB] Disconnected from MySQL.");
+            // Check if username taken
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "SELECT id FROM users WHERE username=?")) {
+                ps.setString(1, username);
+                ResultSet rs = ps.executeQuery();
+                if (rs.next()) return -2; // username taken
             }
-        } catch (SQLException ignored) {}
+
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO users (username, password) VALUES (?,?)",
+                    Statement.RETURN_GENERATED_KEYS)) {
+                ps.setString(1, username);
+                ps.setString(2, hashPassword(password));
+                ps.executeUpdate();
+                ResultSet keys = ps.getGeneratedKeys();
+                if (keys.next()) {
+                    int id = keys.getInt(1);
+                    // Create default settings row
+                    try (PreparedStatement ps2 = conn.prepareStatement(
+                            "INSERT IGNORE INTO user_settings (user_id) VALUES (?)")) {
+                        ps2.setInt(1, id);
+                        ps2.executeUpdate();
+                    }
+                    System.out.println("[DB] Registered: " + username + " (id=" + id + ")");
+                    return id;
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("[DB] Register error: " + e.getMessage());
+        }
+        return -1;
     }
 
+    /** Login. Returns user ID or -1 if credentials wrong. */
+    public int login(String username, String password) {
+        if (conn == null) return -1;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT id, password FROM users WHERE username=?")) {
+            ps.setString(1, username);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) {
+                String stored = rs.getString("password");
+                if (stored.equals(hashPassword(password))) {
+                    return rs.getInt("id");
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("[DB] Login error: " + e.getMessage());
+        }
+        return -1;
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Stats
+    // ─────────────────────────────────────────────────────────────
+
+    public void updateHighScore(int userId, int score) {
+        if (conn == null) return;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE users SET high_score = GREATEST(high_score, ?) WHERE id=?")) {
+            ps.setInt(1, score);
+            ps.setInt(2, userId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("[DB] updateHighScore: " + e.getMessage());
+        }
+    }
+
+    public void incrementKills(int userId, int kills) {
+        if (conn == null) return;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "UPDATE users SET total_kills = total_kills + ? WHERE id=?")) {
+            ps.setInt(1, kills);
+            ps.setInt(2, userId);
+            ps.executeUpdate();
+        } catch (SQLException e) {
+            System.err.println("[DB] incrementKills: " + e.getMessage());
+        }
+    }
+
+    public int getHighScore(int userId) {
+        if (conn == null) return 0;
+        try (PreparedStatement ps = conn.prepareStatement(
+                "SELECT high_score FROM users WHERE id=?")) {
+            ps.setInt(1, userId);
+            ResultSet rs = ps.executeQuery();
+            if (rs.next()) return rs.getInt("high_score");
+        } catch (SQLException e) {
+            System.err.println("[DB] getHighScore: " + e.getMessage());
+        }
+        return 0;
+    }
+
+    /** Save a multiplayer match and per-player stats. */
+    public void saveMpMatch(String mode, int playerCount, int waveReached,
+                            int[] userIds, int[] scores, int[] kills) {
+        if (conn == null) return;
+        try {
+            int matchId;
+            try (PreparedStatement ps = conn.prepareStatement(
+                    "INSERT INTO mp_matches (mode, player_count, wave_reached) VALUES (?,?,?)",
+                    Statement.RETURN_GENERATED_KEYS)) {
+                ps.setString(1, mode);
+                ps.setInt(2, playerCount);
+                ps.setInt(3, waveReached);
+                ps.executeUpdate();
+                ResultSet keys = ps.getGeneratedKeys();
+                if (!keys.next()) return;
+                matchId = keys.getInt(1);
+            }
+            for (int i = 0; i < userIds.length; i++) {
+                try (PreparedStatement ps = conn.prepareStatement(
+                        "INSERT INTO mp_player_stats (match_id,user_id,score,kills) VALUES (?,?,?,?)")) {
+                    ps.setInt(1, matchId);
+                    ps.setInt(2, userIds[i]);
+                    ps.setInt(3, i < scores.length ? scores[i] : 0);
+                    ps.setInt(4, i < kills.length  ? kills[i]  : 0);
+                    ps.executeUpdate();
+                }
+            }
+        } catch (SQLException e) {
+            System.err.println("[DB] saveMpMatch: " + e.getMessage());
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // Helpers
+    // ─────────────────────────────────────────────────────────────
+
     public boolean isConnected() {
-        try { return connection != null && !connection.isClosed(); }
+        try { return conn != null && !conn.isClosed(); }
         catch (SQLException e) { return false; }
     }
 
-    // ════════════════════════════════════════════════════════
-    //  USER OPERATIONS
-    // ════════════════════════════════════════════════════════
+    public void close() {
+        try { if (conn != null) conn.close(); }
+        catch (SQLException ignored) {}
+    }
 
-    /**
-     * Register a new user.
-     * @return "ok" on success, error message on failure
-     */
-    public String registerUser(String username, String password) {
-        if (username == null || username.trim().length() < 3)
-            return "Username must be at least 3 characters.";
-        if (password == null || password.length() < 4)
-            return "Password must be at least 4 characters.";
-        if (!username.matches("[a-zA-Z0-9_]+"))
-            return "Username can only contain letters, numbers, underscores.";
-
+    /** Simple SHA-256 hash — production would use BCrypt. */
+    private String hashPassword(String pw) {
         try {
-            // Check if username taken
-            PreparedStatement check = connection.prepareStatement(
-                    "SELECT id FROM users WHERE username = ?");
-            check.setString(1, username.trim());
-            if (check.executeQuery().next())
-                return "Username already taken.";
-
-            // Insert new user (simple hash for demo — use BCrypt in production)
-            PreparedStatement insert = connection.prepareStatement(
-                    "INSERT INTO users (username, password) VALUES (?, ?)");
-            insert.setString(1, username.trim());
-            insert.setString(2, simpleHash(password));
-            insert.executeUpdate();
-            return "ok";
-
-        } catch (SQLException e) {
-            return "Database error: " + e.getMessage();
-        }
-    }
-
-    /**
-     * Login a user.
-     * @return UserRecord on success, null on failure
-     */
-    public UserRecord loginUser(String username, String password) {
-        try {
-            PreparedStatement stmt = connection.prepareStatement(
-                    "SELECT id, username, high_score FROM users " +
-                            "WHERE username = ? AND password = ?");
-            stmt.setString(1, username.trim());
-            stmt.setString(2, simpleHash(password));
-            ResultSet rs = stmt.executeQuery();
-
-            if (!rs.next()) return null;
-
-            UserRecord user = new UserRecord();
-            user.id        = rs.getInt("id");
-            user.username  = rs.getString("username");
-            user.highScore = rs.getInt("high_score");
-
-            // Update last login
-            PreparedStatement upd = connection.prepareStatement(
-                    "UPDATE users SET last_login = NOW() WHERE id = ?");
-            upd.setInt(1, user.id);
-            upd.executeUpdate();
-
-            return user;
-        } catch (SQLException e) {
-            System.err.println("[DB] Login error: " + e.getMessage());
-            return null;
-        }
-    }
-
-    /**
-     * Update a user's high score (only if new score is higher).
-     */
-    public void updateHighScore(int userId, int score) {
-        try {
-            PreparedStatement stmt = connection.prepareStatement(
-                    "UPDATE users SET high_score = ? " +
-                            "WHERE id = ? AND high_score < ?");
-            stmt.setInt(1, score);
-            stmt.setInt(2, userId);
-            stmt.setInt(3, score);
-            stmt.executeUpdate();
-        } catch (SQLException e) {
-            System.err.println("[DB] High score update error: " + e.getMessage());
-        }
-    }
-
-    // ════════════════════════════════════════════════════════
-    //  MATCH OPERATIONS
-    // ════════════════════════════════════════════════════════
-
-    /**
-     * Create a new match record and return its ID.
-     */
-    public int createMatch(int hostUserId, int playerCount, String mode) {
-        try {
-            PreparedStatement stmt = connection.prepareStatement(
-                    "INSERT INTO matches (host_user_id, player_count, mode) VALUES (?, ?, ?)",
-                    Statement.RETURN_GENERATED_KEYS);
-            if (hostUserId > 0) stmt.setInt(1, hostUserId);
-            else                stmt.setNull(1, Types.INTEGER);
-            stmt.setInt(2, playerCount);
-            stmt.setString(3, mode);
-            stmt.executeUpdate();
-
-            ResultSet keys = stmt.getGeneratedKeys();
-            return keys.next() ? keys.getInt(1) : -1;
-        } catch (SQLException e) {
-            System.err.println("[DB] Create match error: " + e.getMessage());
-            return -1;
-        }
-    }
-
-    /**
-     * Mark a match as ended.
-     */
-    public void endMatch(int matchId) {
-        try {
-            PreparedStatement stmt = connection.prepareStatement(
-                    "UPDATE matches SET ended_at = NOW() WHERE id = ?");
-            stmt.setInt(1, matchId);
-            stmt.executeUpdate();
-        } catch (SQLException e) {
-            System.err.println("[DB] End match error: " + e.getMessage());
-        }
-    }
-
-    /**
-     * Save a player's stats for a match.
-     */
-    public void savePlayerStats(int matchId, int userId, int slot,
-                                int score, int kills, int floors, boolean survived) {
-        try {
-            PreparedStatement stmt = connection.prepareStatement(
-                    "INSERT INTO player_stats " +
-                            "(match_id, user_id, player_slot, score, kills, floors, survived) " +
-                            "VALUES (?, ?, ?, ?, ?, ?, ?)");
-            stmt.setInt(1, matchId);
-            if (userId > 0) stmt.setInt(2, userId);
-            else            stmt.setNull(2, Types.INTEGER);
-            stmt.setInt(3, slot);
-            stmt.setInt(4, score);
-            stmt.setInt(5, kills);
-            stmt.setInt(6, floors);
-            stmt.setBoolean(7, survived);
-            stmt.executeUpdate();
-        } catch (SQLException e) {
-            System.err.println("[DB] Save stats error: " + e.getMessage());
-        }
-    }
-
-    // ════════════════════════════════════════════════════════
-    //  LEADERBOARD
-    // ════════════════════════════════════════════════════════
-
-    /**
-     * Get top 10 leaderboard entries.
-     */
-    public LeaderboardEntry[] getLeaderboard() {
-        try {
-            Statement stmt = connection.createStatement();
-            ResultSet rs   = stmt.executeQuery("SELECT * FROM leaderboard");
-            java.util.List<LeaderboardEntry> list = new java.util.ArrayList<>();
-            int rank = 1;
-            while (rs.next()) {
-                LeaderboardEntry e = new LeaderboardEntry();
-                e.rank      = rank++;
-                e.username  = rs.getString("username");
-                e.highScore = rs.getInt("high_score");
-                list.add(e);
-            }
-            return list.toArray(new LeaderboardEntry[0]);
-        } catch (SQLException e) {
-            System.err.println("[DB] Leaderboard error: " + e.getMessage());
-            return new LeaderboardEntry[0];
-        }
-    }
-
-    // ════════════════════════════════════════════════════════
-    //  HELPER CLASSES
-    // ════════════════════════════════════════════════════════
-
-    public static class UserRecord {
-        public int    id;
-        public String username;
-        public int    highScore;
-        @Override public String toString() {
-            return username + " (Best: " + highScore + ")";
-        }
-    }
-
-    public static class LeaderboardEntry {
-        public int    rank;
-        public String username;
-        public int    highScore;
-        @Override public String toString() {
-            return String.format("#%d  %-20s  %06d", rank, username, highScore);
-        }
-    }
-
-    // ── Very simple password hash (XOR + hex) ────────────────
-    // NOTE: For a real project use BCrypt. This is for simplicity.
-    private String simpleHash(String input) {
-        StringBuilder sb  = new StringBuilder();
-        String        key = "VW2024";
-        for (int i = 0; i < input.length(); i++) {
-            sb.append(String.format("%02x",
-                    (input.charAt(i) ^ key.charAt(i % key.length())) & 0xFF));
-        }
-        return sb.toString();
+            java.security.MessageDigest md =
+                    java.security.MessageDigest.getInstance("SHA-256");
+            byte[] h = md.digest(pw.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder();
+            for (byte b : h) sb.append(String.format("%02x", b));
+            return sb.toString();
+        } catch (Exception e) { return pw; } // fallback
     }
 }

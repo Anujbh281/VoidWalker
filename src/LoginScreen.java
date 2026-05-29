@@ -181,6 +181,7 @@ public class LoginScreen extends JPanel {
         }).start();
     }
 
+    // FIXED: doRegister() now correctly handles boolean return type
     private void doRegister() {
         String user = usernameField.getText().trim();
         String pass = new String(passwordField.getPassword());
@@ -190,13 +191,13 @@ public class LoginScreen extends JPanel {
         }
         setStatus("Registering...", true);
         new Thread(() -> {
-            String result = db.registerUser(user, pass);
+            boolean success = db.registerUser(user, pass);
             SwingUtilities.invokeLater(() -> {
-                if ("ok".equals(result)) {
+                if (success) {
                     setStatus("Account created! Logging in...", true);
                     doLogin();
                 } else {
-                    setStatus(result, false);
+                    setStatus("Username already taken or registration failed.", false);
                 }
             });
         }).start();

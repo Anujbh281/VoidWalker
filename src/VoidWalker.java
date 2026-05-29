@@ -48,7 +48,8 @@ public class VoidWalker extends JFrame {
                 currentUserId   = -1;
                 currentUsername = result.guestName;
             } else {
-                currentUserId   = result.user.id;
+                // FIXED: use userId instead of id
+                currentUserId   = result.user.userId;
                 currentUsername = result.user.username;
                 onlineHighScore = result.user.highScore;
                 System.out.println("[VoidWalker] Logged in: " +

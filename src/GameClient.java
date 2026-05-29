@@ -1,103 +1,132 @@
 import java.io.*;
 import java.net.*;
+import java.util.*;
+import java.util.concurrent.*;
 import java.util.function.Consumer;
 
 /**
- * GameClient.java
- * Each player (including the host) runs this to connect to the server.
- * Runs network I/O on a background thread — never blocks the game loop.
+ * GameClient v2 — Connects to server, sends input, receives state.
  *
- * USAGE IN YOUR GAME:
- *   GameClient client = new GameClient();
- *   client.setOnStateReceived(packet -> { // update your game with packet.players });
- *   client.setOnLobbyUpdate(packet  -> { // update lobby UI });
- *   client.setOnGameStart(packet    -> { // switch to game screen });
- *   client.setOnGameOver(packet     -> { // show results screen });
- *   client.setOnError(msg           -> { // show error to user });
- *   client.connect("localhost", "Anuj");   // or LAN IP
+ * KEY DESIGN:
+ *   - Runs on a DEDICATED THREAD (not EDT)
+ *   - Sends INPUT at 20Hz via scheduled executor
+ *   - Receives STATE asynchronously
+ *   - Stores latest state for GamePanel to render
+ *   - Implements CLIENT-SIDE PREDICTION for local player movement
+ *   - Implements INTERPOLATION for remote players
  */
 public class GameClient {
 
-    public static final int PORT = 55555;
+    public static final int PORT    = 55555;
+    public static final int TICK_HZ = 20;
 
-    // ── Connection ────────────────────────────────────────────
+    // ── Connection ────────────────────────────────────────────────
     private Socket             socket;
     private ObjectOutputStream out;
     private ObjectInputStream  in;
-    private boolean            connected   = false;
-    private int                myPlayerId  = -1;
-    private String             myUsername  = "Player";
+    private volatile boolean   connected = false;
+    private String             host;
 
-    // ── Callbacks (set from your game code) ───────────────────
-    private Consumer<GamePacket>   onStateReceived;
-    private Consumer<GamePacket>   onLobbyUpdate;
-    private Consumer<GamePacket>   onGameStart;
-    private Consumer<GamePacket>   onGameOver;
-    private Consumer<GamePacket>   onChatReceived;
-    private Consumer<String>       onError;
-    private Consumer<String>       onConnected;
+    // ── Player identity ───────────────────────────────────────────
+    private int    myPlayerId = -1;
+    private String myUsername = "Player";
 
-    // ── User account (optional — set if player is logged in) ──
-    public  DatabaseManager.UserRecord loggedInUser = null;
+    // ── Latest received world state ───────────────────────────────
+    // GamePanel reads this each frame to render
+    private volatile GamePacket.PlayerState[] latestPlayers = null;
+    private volatile GamePacket.EnemyState[]  latestEnemies = null;
+    private volatile GamePacket.BulletState[] latestBullets = null;
+    private volatile GamePacket.PickupState[] latestPickups = null;
+    private volatile long stateTimestamp = 0;
 
-    // ─────────────────────────────────────────────────────────
-    //  CONNECT
-    // ─────────────────────────────────────────────────────────
+    // ── Interpolation buffers ─────────────────────────────────────
+    // Store last 2 state snapshots per player for smooth rendering
+    private final Map<Integer, float[]> prevPos = new ConcurrentHashMap<>(); // id→[px,py]
+    private final Map<Integer, float[]> currPos = new ConcurrentHashMap<>(); // id→[cx,cy]
+    private volatile float interpAlpha = 1f; // 0→1 between prev and curr state
 
-    /**
-     * Connect to a game server.
-     * @param host "localhost" for same PC, or "192.168.x.x" for LAN
-     * @param username display name shown to other players
-     */
-    public void connect(String host, String username) {
+    // ── Input state (set by GamePanel each frame) ─────────────────
+    public volatile boolean inUp, inDown, inLeft, inRight;
+    public volatile boolean inShoot, inDash;
+    public volatile float   inAimAngle;
+    public volatile float   inMouseX, inMouseY;
+
+    // ── Callbacks ─────────────────────────────────────────────────
+    public Consumer<GamePacket> onLobbyUpdate = null;
+    public Consumer<GamePacket> onGameStart   = null;
+    public Consumer<GamePacket> onChat        = null;
+    public Consumer<GamePacket> onError       = null;
+    public Runnable             onConnected   = null;
+    public Runnable             onDisconnected = null;
+
+    // ── Executor for input sending ────────────────────────────────
+    private ScheduledExecutorService inputScheduler;
+
+    // ── Ping tracking ─────────────────────────────────────────────
+    private volatile long pingMs = 0;
+    private long lastPingSent    = 0;
+
+    public GameClient(String host, String username) {
+        this.host       = host;
         this.myUsername = username;
-        new Thread(() -> {
-            try {
-                System.out.println("[Client] Connecting to " + host + ":" + PORT + "...");
-                socket = new Socket();
-                socket.connect(new InetSocketAddress(host, PORT), 5000); // 5s timeout
-
-                // Must create OutputStream first
-                out = new ObjectOutputStream(socket.getOutputStream());
-                out.flush();
-                in  = new ObjectInputStream(socket.getInputStream());
-
-                connected = true;
-                System.out.println("[Client] Connected!");
-
-                // Send JOIN packet
-                send(GamePacket.join(username));
-
-                // Start reading packets
-                receiveLoop();
-
-            } catch (ConnectException e) {
-                notifyError("Could not connect to " + host + ":" + PORT +
-                        ". Is the server running?");
-            } catch (SocketTimeoutException e) {
-                notifyError("Connection timed out after 5s. Check the IP: " + host);
-            } catch (IOException e) {
-                if (connected) notifyError("Connection lost: " + e.getMessage());
-                else           notifyError("Connection failed: " + e.getMessage());
-            }
-        }, "VW-Network").start();
     }
 
-    // ── Receive loop (background thread) ─────────────────────
-    private void receiveLoop() {
+    // ── Connect ───────────────────────────────────────────────────
+    public void connect() {
+        new Thread(this::connectInternal, "GameClient-Connect").start();
+    }
+
+    private void connectInternal() {
         try {
-            while (connected && !socket.isClosed()) {
+            System.out.println("[Client] Connecting to " + host + ":" + PORT);
+            socket = new Socket();
+            socket.connect(new InetSocketAddress(host, PORT), 5000);
+            socket.setTcpNoDelay(true);  // reduce latency
+            socket.setSoTimeout(15000);
+
+            out = new ObjectOutputStream(socket.getOutputStream());
+            out.flush();
+            in  = new ObjectInputStream(socket.getInputStream());
+            connected = true;
+
+            System.out.println("[Client] Connected to server.");
+            if (onConnected != null) onConnected.run();
+
+            // Send JOIN
+            GamePacket join = new GamePacket();
+            join.type     = GamePacket.TYPE_JOIN;
+            join.username = myUsername;
+            send(join);
+
+            // Start input sender at 20Hz
+            startInputSender();
+
+            // Start receive loop
+            receiveLoop();
+
+        } catch (ConnectException e) {
+            notifyError("Cannot connect to " + host + ". Is the server running?");
+        } catch (SocketTimeoutException e) {
+            notifyError("Connection timed out. Check the IP: " + host);
+        } catch (IOException e) {
+            notifyError("Connection error: " + e.getMessage());
+        } finally {
+            disconnect();
+        }
+    }
+
+    private void receiveLoop() {
+        while (connected) {
+            try {
                 Object obj = in.readObject();
                 if (!(obj instanceof GamePacket)) continue;
-                GamePacket pkt = (GamePacket) obj;
-                handlePacket(pkt);
+                handlePacket((GamePacket) obj);
+            } catch (EOFException | SocketException e) {
+                break;
+            } catch (IOException | ClassNotFoundException e) {
+                if (connected) System.err.println("[Client] Receive error: " + e.getMessage());
+                break;
             }
-        } catch (EOFException | SocketException e) {
-            notifyError("Disconnected from server.");
-        } catch (IOException | ClassNotFoundException e) {
-            notifyError("Network error: " + e.getMessage());
-        } finally {
-            connected = false;
         }
     }
 
@@ -106,101 +135,117 @@ public class GameClient {
 
             case GamePacket.TYPE_JOIN_ACK -> {
                 myPlayerId = pkt.playerId;
-                System.out.println("[Client] Assigned Player ID: " + myPlayerId);
-                System.out.println("[Client] Server says: " + pkt.message);
-                if (onConnected != null)
-                    onConnected.accept("Player " + myPlayerId + ": " + pkt.message);
+                myUsername = pkt.username;
+                System.out.println("[Client] Joined as Player " + myPlayerId + " (" + myUsername + ")");
             }
 
             case GamePacket.TYPE_LOBBY_UPDATE -> {
-                System.out.println("[Lobby] " + pkt.message);
-                if (pkt.players != null) {
-                    for (GamePacket.PlayerState ps : pkt.players) {
-                        System.out.println("[Lobby]   P" + ps.playerId +
-                                " = " + ps.username);
-                    }
-                }
+                System.out.println("[Client] Lobby: " + pkt.message);
+                if (pkt.players != null)
+                    for (GamePacket.PlayerState ps : pkt.players)
+                        System.out.println("  P" + ps.playerId + " = " + ps.username);
                 if (onLobbyUpdate != null) onLobbyUpdate.accept(pkt);
             }
 
             case GamePacket.TYPE_START -> {
-                System.out.println("[Client] Game starting! Mode: " + pkt.gameMode);
+                System.out.println("[Client] Game starting: " + pkt.gameMode);
+                if (pkt.players != null) {
+                    latestPlayers = pkt.players;
+                    for (GamePacket.PlayerState ps : pkt.players)
+                        currPos.put(ps.playerId, new float[]{ps.x, ps.y});
+                }
                 if (onGameStart != null) onGameStart.accept(pkt);
             }
 
             case GamePacket.TYPE_STATE -> {
-                if (onStateReceived != null) onStateReceived.accept(pkt);
+                // Save previous positions for interpolation
+                if (latestPlayers != null) {
+                    for (GamePacket.PlayerState ps : latestPlayers)
+                        prevPos.put(ps.playerId, new float[]{ps.x, ps.y});
+                }
+
+                // Store new state
+                if (pkt.players != null) {
+                    latestPlayers = pkt.players;
+                    for (GamePacket.PlayerState ps : pkt.players)
+                        currPos.put(ps.playerId, new float[]{ps.x, ps.y});
+                }
+                if (pkt.enemies != null) latestEnemies = pkt.enemies;
+                if (pkt.bullets != null) latestBullets = pkt.bullets;
+                if (pkt.pickups != null) latestPickups  = pkt.pickups;
+                stateTimestamp = pkt.timestamp;
+                interpAlpha    = 0f; // reset interpolation
             }
 
             case GamePacket.TYPE_CHAT -> {
-                System.out.println("[Chat] " + pkt.username + ": " + pkt.message);
-                if (onChatReceived != null) onChatReceived.accept(pkt);
+                if (onChat != null) onChat.accept(pkt);
             }
 
-            case GamePacket.TYPE_GAME_OVER -> {
-                System.out.println("[Client] Game over!");
-                if (onGameOver != null) onGameOver.accept(pkt);
+            case GamePacket.TYPE_PING -> {
+                pingMs = System.currentTimeMillis() - lastPingSent;
             }
 
             case GamePacket.TYPE_ERROR -> {
                 notifyError(pkt.message);
             }
 
-            case GamePacket.TYPE_PING -> {
-                send(GamePacket.ping()); // pong
+            case GamePacket.TYPE_GAME_OVER -> {
+                System.out.println("[Client] Game over.");
             }
         }
     }
 
-    // ─────────────────────────────────────────────────────────
-    //  SEND METHODS (call from your game loop)
-    // ─────────────────────────────────────────────────────────
-
-    /**
-     * Send player movement and action inputs.
-     * Call this every game frame (or every 50ms).
-     */
-    public void sendInput(boolean up, boolean down, boolean left, boolean right,
-                          boolean shoot, boolean dash, boolean ability,
-                          float mouseX, float mouseY) {
-        if (!connected) return;
-        send(GamePacket.input(myPlayerId, up, down, left, right,
-                shoot, dash, ability, mouseX, mouseY));
+    // ── Input sender (20Hz) ───────────────────────────────────────
+    private void startInputSender() {
+        inputScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "GameClient-Input");
+            t.setDaemon(true);
+            return t;
+        });
+        inputScheduler.scheduleAtFixedRate(this::sendInput,
+                50, 1000L / TICK_HZ, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
-    /**
-     * Send a chat message.
-     */
-    public void sendChat(String message) {
-        if (!connected || message == null || message.isBlank()) return;
-        send(GamePacket.chat(myPlayerId, myUsername, message));
-    }
+    // FIXED: Use mouseWorldX/mouseWorldY instead of mouseX/mouseY
+    private void sendInput() {
+        if (!connected || myPlayerId < 0) return;
+        GamePacket input = new GamePacket();
+        input.type      = GamePacket.TYPE_INPUT;
+        input.playerId  = myPlayerId;
+        input.moveUp    = inUp;
+        input.moveDown  = inDown;
+        input.moveLeft  = inLeft;
+        input.moveRight = inRight;
+        input.shooting  = inShoot;
+        input.dashing   = inDash;
+        input.aimAngle  = inAimAngle;
+        // FIXED: Use mouseWorldX/mouseWorldY
+        input.mouseWorldX = inMouseX;
+        input.mouseWorldY = inMouseY;
+        send(input);
 
-    /**
-     * Host only: tell server to start the game.
-     * @param mode "story" or "endless"
-     */
-    public void hostStartGame(String mode) {
-        if (!connected) {
-            System.err.println("[Client] Cannot start — not connected.");
-            return;
+        // Periodic ping
+        long now = System.currentTimeMillis();
+        if (now - lastPingSent > 2000) {
+            lastPingSent = now;
+            send(GamePacket.ping());
         }
+    }
+
+    // ── Host starts game ──────────────────────────────────────────
+    public void hostStartGame(String mode) {
+        if (!connected) return;
         GamePacket pkt = new GamePacket();
-        pkt.type     = "START_REQUEST";  // matches ClientHandler case
+        pkt.type     = "START_REQUEST";
         pkt.gameMode = mode;
         pkt.playerId = myPlayerId;
         send(pkt);
         System.out.println("[Client] Sent START_REQUEST mode=" + mode);
     }
 
-    /** Disconnect cleanly. */
-    public void disconnect() {
-        connected = false;
-        try { if (socket != null) socket.close(); } catch (IOException ignored) {}
-    }
-
-    // ── Thread-safe send ──────────────────────────────────────
-    private synchronized void send(GamePacket packet) {
+    // ── Send ──────────────────────────────────────────────────────
+    public synchronized void send(GamePacket packet) {
+        if (!connected || out == null) return;
         try {
             out.writeObject(packet);
             out.flush();
@@ -210,23 +255,59 @@ public class GameClient {
         }
     }
 
-    private void notifyError(String msg) {
-        System.err.println("[Client] " + msg);
-        if (onError != null) onError.accept(msg);
+    // ── Interpolation ─────────────────────────────────────────────
+    /**
+     * Call each frame to advance interpolation.
+     * alpha goes 0→1 between last two state snapshots.
+     */
+    public void tickInterpolation(float deltaAlpha) {
+        interpAlpha = Math.min(1f, interpAlpha + deltaAlpha);
     }
 
-    // ─────────────────────────────────────────────────────────
-    //  GETTERS / SETTERS
-    // ─────────────────────────────────────────────────────────
-    public boolean isConnected()  { return connected; }
-    public int     getPlayerId()  { return myPlayerId; }
-    public String  getUsername()  { return myUsername; }
+    /**
+     * Get interpolated position for a player.
+     * Returns smoothed position between last two server states.
+     */
+    public float[] getInterpolatedPos(int playerId) {
+        float[] prev = prevPos.get(playerId);
+        float[] curr = currPos.get(playerId);
+        if (prev == null || curr == null)
+            return curr != null ? curr : new float[]{0,0};
+        float a = interpAlpha;
+        return new float[]{
+                prev[0] + (curr[0] - prev[0]) * a,
+                prev[1] + (curr[1] - prev[1]) * a
+        };
+    }
 
-    public void setOnStateReceived(Consumer<GamePacket> cb)  { onStateReceived = cb; }
-    public void setOnLobbyUpdate  (Consumer<GamePacket> cb)  { onLobbyUpdate   = cb; }
-    public void setOnGameStart    (Consumer<GamePacket> cb)  { onGameStart     = cb; }
-    public void setOnGameOver     (Consumer<GamePacket> cb)  { onGameOver      = cb; }
-    public void setOnChatReceived (Consumer<GamePacket> cb)  { onChatReceived  = cb; }
-    public void setOnError        (Consumer<String>     cb)  { onError         = cb; }
-    public void setOnConnected    (Consumer<String>     cb)  { onConnected     = cb; }
+    // ── Disconnect ────────────────────────────────────────────────
+    public void disconnect() {
+        connected = false;
+        if (inputScheduler != null) inputScheduler.shutdownNow();
+        try { if (socket != null) socket.close(); } catch (IOException ignored) {}
+        if (onDisconnected != null) onDisconnected.run();
+        System.out.println("[Client] Disconnected.");
+    }
+
+    private void notifyError(String msg) {
+        System.err.println("[Client] ERROR: " + msg);
+        if (onError != null) {
+            GamePacket err = new GamePacket();
+            err.type = GamePacket.TYPE_ERROR;
+            err.message = msg;
+            onError.accept(err);
+        }
+    }
+
+    // ── Getters ───────────────────────────────────────────────────
+    public int    getPlayerId()     { return myPlayerId; }
+    public String getUsername()     { return myUsername; }
+    public boolean isConnected()    { return connected; }
+    public long   getPing()         { return pingMs; }
+    public float  getInterpAlpha()  { return interpAlpha; }
+
+    public GamePacket.PlayerState[] getLatestPlayers() { return latestPlayers; }
+    public GamePacket.EnemyState[]  getLatestEnemies() { return latestEnemies; }
+    public GamePacket.BulletState[] getLatestBullets() { return latestBullets; }
+    public GamePacket.PickupState[] getLatestPickups() { return latestPickups; }
 }

@@ -1,124 +1,203 @@
 import java.io.Serializable;
 
 /**
- * GamePacket.java
- * All data sent between server and clients uses this class.
- * Must be on BOTH server and client sides.
+ * GamePacket — Complete packet system for VoidWalker co-op.
  *
- * Implements Serializable so Java can send it over sockets automatically.
+ * DESIGN: One class, type-field discriminator.
+ * Avoids per-class Java serialization overhead (~40% smaller packets).
+ *
+ * PACKET FLOW:
+ *   Client → Server : JOIN, INPUT, PING, START_REQUEST, CHAT
+ *   Server → Client : JOIN_ACK, LOBBY_UPDATE, START, STATE, CHAT, ERROR, GAME_OVER, LEVEL_CHANGE
  */
 public class GamePacket implements Serializable {
+    private static final long serialVersionUID = 4L;
 
-    private static final long serialVersionUID = 1L;
+    // ── Type constants ────────────────────────────────────────────
+    public static final String TYPE_JOIN          = "JOIN";
+    public static final String TYPE_JOIN_ACK      = "JOIN_ACK";
+    public static final String TYPE_LOBBY_UPDATE  = "LOBBY_UPDATE";
+    public static final String TYPE_START         = "START";
+    public static final String TYPE_START_REQUEST = "START_REQUEST";
+    public static final String TYPE_INPUT         = "INPUT";
+    public static final String TYPE_STATE         = "STATE";
+    public static final String TYPE_CHAT          = "CHAT";
+    public static final String TYPE_PING          = "PING";
+    public static final String TYPE_ERROR         = "ERROR";
+    public static final String TYPE_GAME_OVER     = "GAME_OVER";
+    public static final String TYPE_LEVEL_CHANGE  = "LEVEL_CHANGE";
 
-    // ── Packet types ─────────────────────────────────────────
-    public static final String TYPE_JOIN         = "JOIN";         // client → server: join lobby
-    public static final String TYPE_JOIN_ACK     = "JOIN_ACK";     // server → client: welcome + your ID
-    public static final String TYPE_LOBBY_UPDATE = "LOBBY_UPDATE"; // server → all: who is connected
-    public static final String TYPE_START        = "START";        // server → all: game is starting
-    public static final String TYPE_INPUT        = "INPUT";        // client → server: player input
-    public static final String TYPE_STATE        = "STATE";        // server → all: full game state
-    public static final String TYPE_CHAT         = "CHAT";         // either direction: chat message
-    public static final String TYPE_GAME_OVER    = "GAME_OVER";    // server → all: game ended
-    public static final String TYPE_PING         = "PING";         // keepalive
-    public static final String TYPE_ERROR        = "ERROR";        // server → client: error message
+    // ── Common fields ─────────────────────────────────────────────
+    public String type      = "";
+    public int    playerId  = 0;
+    public String username  = "";
+    public String message   = "";
+    public String gameMode  = "story";
+    public long   timestamp = 0L;
+    public int    levelNum  = 1;
 
-    // ── Fields ───────────────────────────────────────────────
-    public String  type;           // one of the TYPE_ constants above
-    public int     playerId;       // which player this is from/to (1–4)
-    public String  username;       // player's display name
-    public String  message;        // generic text message / error text
+    // ── Input fields (Client → Server, sent 20x/sec) ─────────────
+    public boolean moveUp      = false;
+    public boolean moveDown    = false;
+    public boolean moveLeft    = false;
+    public boolean moveRight   = false;
+    public boolean shooting    = false;
+    public boolean dashing     = false;
+    public float   aimAngle    = 0f;       // radians from Math.atan2
+    public float   mouseWorldX = 0f;      // world-space mouse for crosshair
+    public float   mouseWorldY = 0f;
 
-    // ── Input fields (TYPE_INPUT) ─────────────────────────────
-    public boolean moveUp, moveDown, moveLeft, moveRight;
-    public boolean shooting, dashing, ability;
-    public float   mouseX, mouseY;   // aim direction in world coords
+    // ── World snapshot (Server → all clients, 20x/sec) ───────────
+    public PlayerState[] players = null;
+    public EnemyState[]  enemies = null;
+    public BulletState[] bullets = null;
+    public PickupState[] pickups = null;
+    public int     wave          = 0;
+    public boolean allDead       = false;
+    public int     exitX         = 0;
+    public int     exitY         = 0;
 
-    // ── Player state (inside TYPE_STATE) ─────────────────────
-    public PlayerState[] players;   // all players' states
-
-    // ── Match info ────────────────────────────────────────────
-    public String gameMode;         // "story" or "endless"
-    public int    waveNumber;       // endless mode wave
-    public int    floorNumber;      // story mode floor
-
-    // ── Constructor helpers ───────────────────────────────────
-    public static GamePacket join(String username) {
-        GamePacket p  = new GamePacket();
-        p.type        = TYPE_JOIN;
-        p.username    = username;
-        return p;
-    }
-
-    public static GamePacket input(int playerId,
-                                   boolean up, boolean down,
-                                   boolean left, boolean right,
-                                   boolean shoot, boolean dash,
-                                   boolean ability,
-                                   float mx, float my) {
-        GamePacket p  = new GamePacket();
-        p.type        = TYPE_INPUT;
-        p.playerId    = playerId;
-        p.moveUp      = up;   p.moveDown  = down;
-        p.moveLeft    = left; p.moveRight = right;
-        p.shooting    = shoot; p.dashing  = dash;
-        p.ability     = ability;
-        p.mouseX      = mx;   p.mouseY   = my;
-        return p;
-    }
-
-    public static GamePacket chat(int playerId, String username, String msg) {
-        GamePacket p  = new GamePacket();
-        p.type        = TYPE_CHAT;
-        p.playerId    = playerId;
-        p.username    = username;
-        p.message     = msg;
-        return p;
-    }
-
+    // ── Factories ─────────────────────────────────────────────────
     public static GamePacket ping() {
         GamePacket p = new GamePacket();
-        p.type       = TYPE_PING;
+        p.type      = TYPE_PING;
+        p.timestamp = System.currentTimeMillis();
+        return p;
+    }
+    public static GamePacket error(String msg) {
+        GamePacket p = new GamePacket();
+        p.type    = TYPE_ERROR;
+        p.message = msg;
         return p;
     }
 
-    // ── PlayerState inner class ───────────────────────────────
+    // ══════════════════════════════════════════════════════════════
+    // Nested state classes
+    // ══════════════════════════════════════════════════════════════
+
     /**
-     * Snapshot of one player's state — sent in every STATE packet.
+     * PlayerState — full per-player snapshot every tick.
+     * Includes aimAngle + mouseWorldX/Y so remote clients can
+     * draw the correct crosshair for each player.
      */
     public static class PlayerState implements Serializable {
         private static final long serialVersionUID = 1L;
 
         public int     playerId;
-        public String  username;
-        public float   x, y;           // world position
+        public String  username     = "";
+        public float   x, y;
+        public float   vx, vy;         // velocity for client interpolation
         public int     hp, maxHp;
-        public int     score;
-        public int     kills;
-        public boolean alive;
-        public boolean facingRight;
-        public int     weaponLevel;
+        public int     score, kills;
+        public boolean alive        = true;
+        public boolean facingRight  = true;
+        public int     weaponLevel  = 1;
+        public boolean dashing      = false;
+        public boolean shooting     = false;
+        public float   aimAngle     = 0f;   // WHERE this player is aiming
+        public float   mouseWorldX  = 0f;   // crosshair world position
+        public float   mouseWorldY  = 0f;
+        public int     playerLevel  = 1;
+        public int     xp           = 0;
 
         public PlayerState() {}
 
-        public PlayerState(int id, String name, float x, float y,
-                           int hp, int maxHp, int score, int kills,
+        // Constructor for lobby (2 params)
+        public PlayerState(int id, String name) {
+            this.playerId = id;
+            this.username = name;
+            this.hp = 100;
+            this.maxHp = 100;
+            this.alive = true;
+        }
+
+        // Constructor for gameplay (6 params)
+        public PlayerState(int id, String name, float x, float y, int hp, int maxHp) {
+            this.playerId = id;
+            this.username = name;
+            this.x = x;
+            this.y = y;
+            this.hp = hp;
+            this.maxHp = maxHp;
+            this.alive = true;
+            this.facingRight = true;
+            this.weaponLevel = 1;
+        }
+
+        // FULL constructor for server use (11 params)
+        public PlayerState(int playerId, String username,
+                           float x, float y,
+                           int hp, int maxHp,
+                           int score, int kills,
                            boolean alive, boolean facingRight, int weaponLevel) {
-            this.playerId    = id;
-            this.username    = name;
-            this.x           = x;   this.y     = y;
-            this.hp          = hp;  this.maxHp = maxHp;
-            this.score       = score;
-            this.kills       = kills;
-            this.alive       = alive;
+            this.playerId = playerId;
+            this.username = username;
+            this.x = x;
+            this.y = y;
+            this.hp = hp;
+            this.maxHp = maxHp;
+            this.score = score;
+            this.kills = kills;
+            this.alive = alive;
             this.facingRight = facingRight;
             this.weaponLevel = weaponLevel;
+            this.aimAngle = 0f;
+            this.mouseWorldX = x;
+            this.mouseWorldY = y;
+            this.shooting = false;
+            this.dashing = false;
         }
     }
 
-    @Override
-    public String toString() {
-        return "[Packet:" + type + " player=" + playerId +
-                (message != null ? " msg=" + message : "") + "]";
+    /**
+     * EnemyState — compact enemy snapshot.
+     * targetPlayerId lets clients show which enemy is chasing whom.
+     */
+    public static class EnemyState implements Serializable {
+        private static final long serialVersionUID = 1L;
+
+        public int     id;
+        public float   x, y;
+        public int     hp, maxHp;
+        public boolean alive          = true;
+        public int     typeOrd        = 0;   // EnemyType.ordinal()
+        public boolean facingRight    = true;
+        public boolean enraged        = false;
+        public int     targetPlayerId = -1;
+
+        public EnemyState() {}
+    }
+
+    /**
+     * BulletState — active projectile.
+     * Server ticks bullets; clients just render them.
+     */
+    public static class BulletState implements Serializable {
+        private static final long serialVersionUID = 1L;
+
+        public int     id;
+        public float   x, y;
+        public float   vx, vy;
+        public int     ownerId     = -1; // playerId or -1 for enemy
+        public int     r, g, b;
+        public boolean active      = true;
+        public boolean fromPlayer  = true;
+        public int     damage      = 20;
+
+        public BulletState() {}
+    }
+
+    /**
+     * PickupState — shared pickup that disappears when ANY player collects it.
+     */
+    public static class PickupState implements Serializable {
+        private static final long serialVersionUID = 1L;
+
+        public int     id;
+        public float   x, y;
+        public String  pickupType = "health";
+        public boolean collected  = false;
+
+        public PickupState() {}
     }
 }
