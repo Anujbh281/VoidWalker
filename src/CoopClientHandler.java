@@ -22,8 +22,16 @@ public class CoopClientHandler implements Runnable {
     private volatile boolean   connected = true;
 
     // Per-player bullet rate limiter
+    // INCREASED: 350ms between bullets = ~2.8 bullets per second max
+    // This gives a satisfying fire rate without spam
     private long lastBulletMs           = 0L;
-    private static final long BULLET_INTERVAL = 95L; // ~10/sec max
+    private static final long BULLET_INTERVAL = 350L; // Increased from 95ms to 350ms
+
+    // Optional: Track consecutive bullets for burst detection
+    private int  consecutiveShots       = 0;
+    private long lastShotTime           = 0L;
+    private static final long BURST_WINDOW_MS = 500L;
+    private static final int  MAX_BURST_SHOTS = 3;
 
     public CoopClientHandler(Socket socket, int playerId, CoopGameServer server) {
         this.socket   = socket;
@@ -75,14 +83,36 @@ public class CoopClientHandler implements Runnable {
             case GamePacket.TYPE_INPUT -> {
                 if (!server.isGameStarted()) return;
 
-                // Per-player shoot rate limit
+                // Per-player shoot rate limit with burst detection
                 if (pkt.shooting) {
                     long now = System.currentTimeMillis();
+
+                    // Check if enough time has passed since last bullet
                     if (now - lastBulletMs < BULLET_INTERVAL) {
+                        // Too soon — suppress this bullet
                         pkt.shooting = false;
                     } else {
+                        // Anti-burst: detect if player is trying to fire too many shots rapidly
+                        if (now - lastShotTime < BURST_WINDOW_MS) {
+                            consecutiveShots++;
+                            if (consecutiveShots > MAX_BURST_SHOTS) {
+                                // Burst detected — impose extra delay
+                                pkt.shooting = false;
+                                // Optional: send a warning to client (commented out)
+                                // GamePacket warn = GamePacket.error("Slow down your firing!");
+                                // send(warn);
+                                break;
+                            }
+                        } else {
+                            consecutiveShots = 1;
+                        }
+
                         lastBulletMs = now;
+                        lastShotTime = now;
                     }
+                } else {
+                    // Reset burst counter when not shooting
+                    consecutiveShots = 0;
                 }
 
                 server.applyInput(playerId, pkt);

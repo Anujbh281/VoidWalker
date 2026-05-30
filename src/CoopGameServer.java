@@ -21,6 +21,10 @@ import java.util.concurrent.atomic.AtomicInteger;
  *   Enemies are spawned server-side in spawnWave(). The STATE packet
  *   includes all EnemyState[] so clients render from server data only.
  *   Clients NEVER spawn enemies locally in multiplayer.
+ *
+ * BULLET COOLDOWN:
+ *   Server-side double protection with MIN_BULLET_INTERVAL_MS = 300ms
+ *   Prevents spam even if client bypasses client-side rate limiting.
  */
 public class CoopGameServer {
 
@@ -53,6 +57,13 @@ public class CoopGameServer {
     private boolean      waitingForWave = true;
     private int          waveCooldown   = 120; // ticks
     private boolean      isEndless      = false;
+
+    // Cache of valid floor tile positions for enemy spawning
+    private final List<int[]> validSpawnTiles = new ArrayList<>();
+
+    // ── Server-side bullet cooldown (double protection) ───────────
+    private final ConcurrentHashMap<Integer, Long> lastBulletTime = new ConcurrentHashMap<>();
+    private static final long MIN_BULLET_INTERVAL_MS = 300L; // ~3.3 bullets/sec max
 
     // ── DatabaseManager ───────────────────────────────────────────
     private DatabaseManager db;
@@ -135,7 +146,7 @@ public class CoopGameServer {
             running = true;
 
             System.out.println("╔════════════════════════════════════╗");
-            System.out.println("║  VOIDWALKER CO-OP SERVER v3.0      ║");
+            System.out.println("║  VOIDWALKER CO-OP SERVER v3.2      ║");
             System.out.printf ("║  Port  : %-26d║%n", PORT);
             System.out.printf ("║  MaxPly: %-26d║%n", MAX_PLAYERS);
             System.out.println("╚════════════════════════════════════╝");
@@ -220,10 +231,45 @@ public class CoopGameServer {
         serverEnemies.clear();
         serverBullets.clear();
         serverPickups.clear();
+        validSpawnTiles.clear();
+
         try {
             serverLevel = new Level(num, new SaveData());
             System.out.println("[Server] Level " + num + " loaded. Spawn=("
                     + (int)serverLevel.spawnX + "," + (int)serverLevel.spawnY + ")");
+
+            // ── SCAN FOR VALID FLOOR TILES ────────────────────────
+            int TILE = Level.TILE;
+            int cols = serverLevel.widthPx()  / TILE;
+            int rows = serverLevel.heightPx() / TILE;
+
+            int spawnTileX = (int)(serverLevel.spawnX / TILE);
+            int spawnTileY = (int)(serverLevel.spawnY / TILE);
+            int MIN_DIST_TILES = 5;
+
+            for (int row = 1; row < rows-1; row++) {
+                for (int col = 1; col < cols-1; col++) {
+                    float wx = col * TILE + TILE/2f;
+                    float wy = row * TILE + TILE/2f;
+
+                    if (serverLevel.isWall(wx, wy)) continue;
+
+                    float pad = 14f;
+                    if (serverLevel.isWall(wx-pad, wy-pad)) continue;
+                    if (serverLevel.isWall(wx+pad, wy-pad)) continue;
+                    if (serverLevel.isWall(wx-pad, wy+pad)) continue;
+                    if (serverLevel.isWall(wx+pad, wy+pad)) continue;
+
+                    int dx = col - spawnTileX;
+                    int dy = row - spawnTileY;
+                    if (dx*dx + dy*dy < MIN_DIST_TILES * MIN_DIST_TILES) continue;
+
+                    validSpawnTiles.add(new int[]{col, row});
+                }
+            }
+
+            System.out.println("[Server] Valid enemy spawn tiles: " + validSpawnTiles.size());
+
         } catch (Exception e) {
             System.err.println("[Server] Level load error: " + e.getMessage());
             serverLevel = null;
@@ -274,7 +320,6 @@ public class CoopGameServer {
     // ── Wave management ───────────────────────────────────────────
     private void tickWaves() {
         if (!waitingForWave) {
-            // Check if all enemies dead
             boolean anyAlive = false;
             synchronized (serverEnemies) {
                 for (ServerEnemy en : serverEnemies)
@@ -282,7 +327,7 @@ public class CoopGameServer {
             }
             if (!anyAlive) {
                 waitingForWave = true;
-                waveCooldown   = 100; // ~5s at 20Hz
+                waveCooldown   = 100;
                 System.out.println("[Server] Wave " + waveNumber + " cleared!");
             }
         } else {
@@ -290,20 +335,16 @@ public class CoopGameServer {
         }
     }
 
-    /**
-     * ENEMY SPAWNING — server-side only.
-     * Enemies are placed around the arena perimeter so they
-     * always spawn in walkable space away from spawn point.
-     */
     private void spawnWave() {
         waveNumber++;
         synchronized (serverEnemies) { serverEnemies.clear(); }
         synchronized (serverBullets) { serverBullets.clear(); }
         waitingForWave = false;
 
-        float cx = (serverLevel != null) ? serverLevel.widthPx()  / 2f : 600f;
-        float cy = (serverLevel != null) ? serverLevel.heightPx() / 2f : 600f;
-        float arenaR = Math.min(cx, cy) * 0.7f;
+        if (validSpawnTiles.isEmpty()) {
+            spawnWaveFallback();
+            return;
+        }
 
         float hpScale  = 1f + waveNumber * 0.12f;
         float spdScale = 1f + waveNumber * 0.03f;
@@ -311,21 +352,18 @@ public class CoopGameServer {
         boolean isBossWave   = (waveNumber % 10 == 0);
         boolean isMiniBoss   = (!isBossWave && waveNumber % 5 == 0);
         int count = isBossWave ? 1 : (isMiniBoss ? 3 + waveNumber : 4 + waveNumber * 2);
-        count = Math.min(count, 35);
+        count = Math.min(count, Math.min(35, validSpawnTiles.size()));
 
-        Random rng = new Random(waveNumber * 9999L);
+        Random rng = new Random(waveNumber * 7919L);
+        List<int[]> shuffled = new ArrayList<>(validSpawnTiles);
+        Collections.shuffle(shuffled, rng);
+
+        int TILE = Level.TILE;
         synchronized (serverEnemies) {
             for (int i = 0; i < count; i++) {
-                double angle = Math.PI * 2 * i / count + rng.nextDouble() * 0.3;
-                float  r     = arenaR * (0.6f + rng.nextFloat() * 0.4f);
-                float  ex    = cx + (float)(Math.cos(angle) * r);
-                float  ey    = cy + (float)(Math.sin(angle) * r);
-
-                // Clamp to level bounds
-                if (serverLevel != null) {
-                    ex = Math.max(48, Math.min(serverLevel.widthPx()  - 48, ex));
-                    ey = Math.max(48, Math.min(serverLevel.heightPx() - 48, ey));
-                }
+                int[] tile = shuffled.get(i);
+                float ex = tile[0] * TILE + TILE/2f + (rng.nextFloat() - 0.5f) * 12f;
+                float ey = tile[1] * TILE + TILE/2f + (rng.nextFloat() - 0.5f) * 12f;
 
                 int typeOrd;
                 if (isBossWave)              typeOrd = 2;
@@ -339,14 +377,41 @@ public class CoopGameServer {
                 serverEnemies.add(en);
             }
         }
-        System.out.printf("[Server] Wave %d spawned: %d enemies%n", waveNumber, count);
+        System.out.printf("[Server] Wave %d spawned: %d enemies on floor tiles%n", waveNumber, count);
+    }
+
+    private void spawnWaveFallback() {
+        float cx = (serverLevel != null) ? serverLevel.widthPx() / 2f : 600f;
+        float cy = (serverLevel != null) ? serverLevel.heightPx() / 2f : 600f;
+        int count = Math.min(4 + waveNumber * 2, 20);
+        float hpScale = 1f + waveNumber * 0.12f;
+        Random rng = new Random(waveNumber);
+
+        synchronized (serverEnemies) {
+            for (int i = 0; i < count; i++) {
+                float ex = cx, ey = cy;
+                for (int attempt = 0; attempt < 20; attempt++) {
+                    double angle = Math.PI * 2 * rng.nextDouble();
+                    float r = 100f + rng.nextFloat() * 200f;
+                    float tx = cx + (float)(Math.cos(angle) * r);
+                    float ty = cy + (float)(Math.sin(angle) * r);
+                    if (serverLevel == null || !serverLevel.isWall(tx, ty)) {
+                        ex = tx; ey = ty; break;
+                    }
+                }
+                ServerEnemy en = new ServerEnemy(nextEnemyId.getAndIncrement(), ex, ey, 0);
+                en.hp = (int)(en.maxHp * hpScale);
+                en.maxHp = en.hp;
+                serverEnemies.add(en);
+            }
+        }
+        System.out.printf("[Server] Wave %d (fallback): %d enemies%n", waveNumber, count);
     }
 
     // ── Enemy AI ─────────────────────────────────────────────────
     private void tickEnemies() {
         if (playerStates.isEmpty()) return;
 
-        // Collect alive players once per tick
         List<GamePacket.PlayerState> alivePlayers = new ArrayList<>();
         for (GamePacket.PlayerState ps : playerStates.values())
             if (ps.alive) alivePlayers.add(ps);
@@ -358,7 +423,6 @@ public class CoopGameServer {
             for (ServerEnemy en : serverEnemies) {
                 if (!en.alive) continue;
 
-                // Find nearest alive player
                 GamePacket.PlayerState target = null;
                 float minDist = Float.MAX_VALUE;
                 for (GamePacket.PlayerState ps : alivePlayers) {
@@ -374,25 +438,20 @@ public class CoopGameServer {
                 float dist = (float)Math.sqrt(dx*dx + dy*dy);
 
                 if (en.typeOrd == 1) {
-                    // RANGER: stay at range, shoot
                     float preferDist = 220f;
                     if (dist > preferDist + 20) {
                         moveEnemyToward(en, target.x, target.y, en.speed);
                     } else if (dist < preferDist - 20) {
                         moveEnemyToward(en, target.x, target.y, -en.speed);
                     }
-                    // Shoot if in range
                     if (dist < 400 && now - en.lastShootMs > en.shootCooldownMs) {
                         en.lastShootMs = now;
                         float angle = (float)Math.atan2(dy, dx);
                         spawnEnemyBullet(en.x, en.y, angle, en.damage);
                     }
                 } else {
-                    // GRUNT / BOSS: chase
                     float spd = en.enraged ? en.speed * 1.5f : en.speed;
                     moveEnemyToward(en, target.x, target.y, spd);
-
-                    // Melee contact
                     if (dist < 28) {
                         target.hp -= en.damage;
                         if (target.hp < 0) target.hp = 0;
@@ -411,7 +470,6 @@ public class CoopGameServer {
         float nx = en.x + (dx/d) * speed;
         float ny = en.y + (dy/d) * speed;
 
-        // Wall collision
         if (serverLevel != null) {
             if (!serverLevel.isWall(nx, en.y)) en.x = nx;
             if (!serverLevel.isWall(en.x, ny)) en.y = ny;
@@ -447,7 +505,6 @@ public class CoopGameServer {
                 b.x += b.vx;
                 b.y += b.vy;
 
-                // Out of bounds / wall
                 if (serverLevel != null && serverLevel.isWall(b.x, b.y)) {
                     b.active = false; continue;
                 }
@@ -460,7 +517,6 @@ public class CoopGameServer {
                 }
 
                 if (b.fromPlayer) {
-                    // Check enemy hits
                     synchronized (serverEnemies) {
                         for (ServerEnemy en : serverEnemies) {
                             if (!en.alive) continue;
@@ -468,16 +524,12 @@ public class CoopGameServer {
                             if (dx*dx + dy*dy < 24*24) {
                                 en.takeDamage(b.damage);
                                 b.active = false;
-
-                                if (!en.alive) {
-                                    onEnemyKilled(en);
-                                }
+                                if (!en.alive) onEnemyKilled(en);
                                 break;
                             }
                         }
                     }
                 } else {
-                    // Enemy bullet hits players
                     for (GamePacket.PlayerState ps : playerStates.values()) {
                         if (!ps.alive) continue;
                         float dx = ps.x - b.x, dy = ps.y - b.y;
@@ -495,7 +547,6 @@ public class CoopGameServer {
     }
 
     private void onEnemyKilled(ServerEnemy en) {
-        // Give score to nearest player
         GamePacket.PlayerState nearest = null;
         float minD = Float.MAX_VALUE;
         for (GamePacket.PlayerState ps : playerStates.values()) {
@@ -509,7 +560,6 @@ public class CoopGameServer {
             nearest.kills++;
         }
 
-        // Chance to spawn pickup
         if (Math.random() < 0.30) {
             GamePacket.PickupState pk = new GamePacket.PickupState();
             pk.id         = nextPickupId.getAndIncrement();
@@ -603,15 +653,23 @@ public class CoopGameServer {
             ps.y = Math.max(28, Math.min(2000, ny));
         }
 
-        // Aim state — stored in PlayerState so ALL clients see this player's aim
+        // Aim state
         ps.aimAngle   = input.aimAngle;
         ps.mouseWorldX = input.mouseWorldX;
         ps.mouseWorldY = input.mouseWorldY;
         ps.shooting   = input.shooting;
         ps.dashing    = input.dashing;
 
-        // Shoot — rate limited per player in CoopClientHandler
-        if (input.shooting) spawnPlayerBullet(ps);
+        // ── SERVER-SIDE BULLET COOLDOWN (double protection) ────────
+        if (input.shooting) {
+            long now = System.currentTimeMillis();
+            long last = lastBulletTime.getOrDefault(playerId, 0L);
+            if (now - last >= MIN_BULLET_INTERVAL_MS) {
+                lastBulletTime.put(playerId, now);
+                spawnPlayerBullet(ps);
+            }
+            // else: too soon — bullet suppressed
+        }
     }
 
     private void spawnPlayerBullet(GamePacket.PlayerState ps) {
@@ -639,6 +697,7 @@ public class CoopGameServer {
     public synchronized void playerDisconnected(int playerId) {
         clients.remove(playerId);
         playerStates.remove(playerId);
+        lastBulletTime.remove(playerId);
         System.out.println("[Server] P" + playerId + " disconnected. Players: " + clients.size());
         if (gameStarted && clients.isEmpty()) {
             System.out.println("[Server] All players gone, stopping.");
